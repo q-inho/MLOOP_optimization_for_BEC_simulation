@@ -76,16 +76,16 @@ class BECSimulation:
                 self.params[f'{stage["name"]}_P_y'] = 1.0 - 0.20 * i
 
     def trap_frequencies(self, P_x, P_y, t):
-        U_x = max(0, 1e-6 * P_x * (1 - 0.3 * t / self.stages[-1]['end_time']))
-        U_y = max(0, 1e-6 * P_y * (1 - 0.3 * t / self.stages[-1]['end_time']))
+        U_x = max(1e-10, 1e-6 * P_x * (1 - 0.5 * t / self.stages[-1]['end_time']))
+        U_y = max(1e-10, 1e-6 * P_y * (1 - 0.5 * t / self.stages[-1]['end_time']))
 
-        nu_x = max(1e-10, np.sqrt(4 * U_x / (self.m * self.params['wx']**2)) / (2 * np.pi))
-        nu_y = max(1e-10, np.sqrt(4 * U_y / (self.m * self.params['wy']**2)) / (2 * np.pi))
-        nu_z = max(1e-10, np.sqrt(2 * g / (self.params['wx'] + self.params['wy'])) / (2 * np.pi))
+        nu_x = max(1, np.sqrt(4 * U_x / (self.m * self.params['wx']**2)) / (2 * np.pi))
+        nu_y = max(1, np.sqrt(4 * U_y / (self.m * self.params['wy']**2)) / (2 * np.pi))
+        nu_z = max(1, np.sqrt(2 * g / (self.params['wx'] + self.params['wy'])) / (2 * np.pi))
 
         # Implement adaptive adjustment to match paper's frequencies
         nu_mean = np.mean([nu_x, nu_y, nu_z])
-        target_freq = 185 * (1 - 0.7 * t / self.stages[-1]['end_time'])
+        target_freq = max(1, 185 * (1 - 0.8 * t / self.stages[-1]['end_time']))
         adjustment = target_freq / nu_mean
         return nu_x * adjustment, nu_y * adjustment, nu_z * adjustment
 
@@ -100,12 +100,15 @@ class BECSimulation:
 
     def bec_fraction(self, N, T, nu_x, nu_y, nu_z):
         Tc = self.critical_temperature(N, nu_x, nu_y, nu_z)
-        return max(0, 1 - (T / Tc)**3 - 0.7 * (N**(-1/3) * (T / Tc)))
+        if T >= Tc:
+            return 0
+        else:
+            return max(0, 1 - (T / Tc)**3)
 
     def raman_cooling_rate(self, T, Omega_R, Gamma_OP, delta):
         recoil_energy = (h ** 2) / (2 * self.m * self.wavelength ** 2)
         eta = recoil_energy / (k * T)
-        return 50 * eta * Omega_R**2 * Gamma_OP / (4 * delta**2) * np.sqrt(self.m / (2 * k * T)) * (1 + (T / (1e-6))**2)
+        return 200 * eta * Omega_R**2 * Gamma_OP / (4 * delta**2) * np.sqrt(self.m / (2 * k * T)) * (1 + (T / (1e-6))**2)
 
     def heating_rate(self, N, T, nu_x, nu_y, nu_z):
         nu_mean = np.mean([nu_x, nu_y, nu_z])
@@ -114,22 +117,24 @@ class BECSimulation:
     def light_assisted_loss_rate(self, N, T, nu_x, nu_y, nu_z, Gamma_OP):
         nu_mean = np.mean([nu_x, nu_y, nu_z])
         n0 = N * (self.m * nu_mean**2 / (2 * np.pi * k * T))**(3/2)
-        beta = 5e-13
+        beta = 1e-12  # Increased from 5e-13
         return beta * Gamma_OP * n0 * (T / (1e-6))**0.5
 
     def evaporation_rate(self, N, T, nu_x, nu_y, nu_z, eta, t):
-        tilt_factor = 3.0
-        gravity_assist = 1 + np.sin(np.pi * t / self.stages[-1]['end_time'])
+        tilt_factor = 10.0  # Increased from 5.0
+        gravity_assist = 1 + 2 * np.sin(np.pi * t / self.stages[-1]['end_time'])  # Increased amplitude
         return tilt_factor * gravity_assist * self.collision_rate(N, T, nu_x, nu_y, nu_z) * eta * np.exp(-eta) * (eta - 4) / (eta - 5)
 
     def critical_temperature(self, N, nu_x, nu_y, nu_z):
         omega_mean = 2 * np.pi * np.mean([nu_x, nu_y, nu_z])
-        Tc_ideal = hbar * omega_mean * (N / zeta(3))**(1/3) / k
         
-        # Prevent division by zero
+        # Prevent division by zero and negative values
+        N = max(N, 1e-10)
         nu_x = max(nu_x, 1e-10)
         nu_y = max(nu_y, 1e-10)
         nu_z = max(nu_z, 1e-10)
+        
+        Tc_ideal = hbar * omega_mean * (N / zeta(3))**(1/3) / k
         
         # Finite size correction
         delta_Tc_fs = -0.73 * (omega_mean / (2*np.pi*nu_x) + omega_mean / (2*np.pi*nu_y) + omega_mean / (2*np.pi*nu_z)) * Tc_ideal / N**(1/3)
@@ -138,12 +143,12 @@ class BECSimulation:
         a_ho = np.sqrt(hbar / (self.m * omega_mean))
         delta_Tc_int = -1.33 * Tc_ideal * (N**(1/6) * self.a / a_ho)
         
-        return Tc_ideal + delta_Tc_fs + delta_Tc_int
+        return max(Tc_ideal + delta_Tc_fs + delta_Tc_int, 1e-10)  # Ensure positive temperature
 
     def system_evolution(self, t, state):
         N, T = state
-        N = max(N, 1e-10)  # Prevent N from becoming zero
-        T = max(T, 1e-10)  # Prevent T from becoming zero
+        N = max(N, 1e-10)  # Prevent N from becoming too small
+        T = max(T, 1e-10)  # Prevent T from becoming too small
 
         stage = next((s for s in self.stages if s['start_time'] <= t < s['end_time']), self.stages[-1])
 
@@ -151,31 +156,31 @@ class BECSimulation:
         P_y = self.params[f'{stage["name"]}_P_y'] if f'{stage["name"]}_P_y' in self.params else 1.0
         nu_x, nu_y, nu_z = self.trap_frequencies(P_x, P_y, t)
 
-        if stage['name'].startswith('Raman'):
-            Omega_R = self.params[f'{stage["name"]}_Omega_R']
-            Gamma_OP = self.params[f'{stage["name"]}_Gamma_OP']
-            delta = self.params[f'{stage["name"]}_delta']
-            gamma_cool = self.raman_cooling_rate(T, Omega_R, Gamma_OP, delta)
-            gamma_heat = self.heating_rate(N, T, nu_x, nu_y, nu_z)
-            dNdt = -self.params['gamma_bg'] * N - self.light_assisted_loss_rate(N, T, nu_x, nu_y, nu_z, Gamma_OP)
-            dTdt = -gamma_cool * T + gamma_heat
-        elif stage['name'].startswith('Evap'):
-            eta = self.params[f'{stage["name"]}_eta']
-            gamma_evap = self.evaporation_rate(N, T, nu_x, nu_y, nu_z, eta, t)
-            dNdt = -self.params['gamma_bg'] * N - gamma_evap * N
-            dTdt = -(eta - 3) / 3 * gamma_evap * T
-            # Add a small amount of Raman cooling during evaporation
-            Omega_R = self.params['Omega_R_0'] * 0.1
-            Gamma_OP = 2 * np.pi * 500
-            delta = 2 * np.pi * 4.33e9
-            gamma_cool = self.raman_cooling_rate(T, Omega_R, Gamma_OP, delta) * 0.1
-            dTdt -= gamma_cool * T
-        else:  # MOT
-            dNdt = 0
-            dTdt = 0
+        print(f"Time: {t*1e3:.1f} ms, Stage: {stage['name']}, N: {N:.2e}, T: {T*1e6:.2f} µK")
+        print(f"Trap frequencies: nu_x = {nu_x:.2f} Hz, nu_y = {nu_y:.2f} Hz, nu_z = {nu_z:.2f} Hz")
 
-        dNdt = np.clip(dNdt, -N/10, N/10)  # Limit the rate of atom loss
-        dTdt = np.clip(dTdt, -T/10, T/10)  # Limit the rate of temperature change
+        # Smooth transition between Raman and evaporative cooling
+        raman_weight = 1.0 if stage['name'].startswith('Raman') else 0.0
+        evap_weight = 1.0 if stage['name'].startswith('Evap') else 0.0
+        if stage['name'].startswith('Evap'):
+            raman_weight = max(0, 1 - (t - stage['start_time']) / (stage['end_time'] - stage['start_time']))
+            evap_weight = 1 - raman_weight
+
+        Omega_R = self.params['Omega_R_0'] * raman_weight
+        Gamma_OP = 2 * np.pi * 2000 * raman_weight
+        delta = 2 * np.pi * 4.33e9
+        eta = 7 * evap_weight
+
+        gamma_cool = self.raman_cooling_rate(T, Omega_R, Gamma_OP, delta) * raman_weight
+        gamma_heat = self.heating_rate(N, T, nu_x, nu_y, nu_z)
+        gamma_evap = self.evaporation_rate(N, T, nu_x, nu_y, nu_z, eta, t) * evap_weight
+
+        dNdt = max(-0.1 * N, -self.params['gamma_bg'] * N - self.light_assisted_loss_rate(N, T, nu_x, nu_y, nu_z, Gamma_OP) * raman_weight - gamma_evap * N * evap_weight)
+        dTdt = max(-0.1 * T, -gamma_cool * T + gamma_heat - (eta - 3) / 3 * gamma_evap * T * evap_weight)
+
+        print(f"Raman cooling: gamma_cool = {gamma_cool:.2e}, gamma_heat = {gamma_heat:.2e}")
+        print(f"Evaporation: gamma_evap = {gamma_evap:.2e}")
+        print(f"dNdt = {dNdt:.2e}, dTdt = {dTdt:.2e}")
 
         return [dNdt, dTdt]
 
@@ -439,10 +444,3 @@ if __name__ == "__main__":
     plt.close()
 
     print("Cooling process plot saved as 'cooling_process.png'.")
-
-x_values = np.linspace(0, len(results) - 1, 20, dtype=int)
-for x in x_values:
-    result = results[x]
-    print(f"Time: {result['time']*1e3:.1f} ms, Stage: {result['stage']}, "
-            f"T: {result['T']*1e6:.2f} µK, N: {result['N']:.2e}, "
-            f"BEC fraction: {result['BEC_fraction']:.2%}")
