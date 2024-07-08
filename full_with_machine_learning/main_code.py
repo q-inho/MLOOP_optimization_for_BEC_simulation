@@ -5,6 +5,9 @@ from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+import logging
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Rubidium-87 properties
 class Rb87:
@@ -47,7 +50,7 @@ class DipleTrap:
         self.w_z = w_z
         self.wavelength = wavelength
         self.k = 2 * np.pi / wavelength
-        self.alpha = 5.4e-39
+        self.alpha = 5.4e-39  # Polarizability of Rb87 at 1064 nm
         self.update_trap_frequencies()
 
     def update_trap_frequencies(self):
@@ -57,6 +60,9 @@ class DipleTrap:
         self.omega_y = np.sqrt(4 * U0_z / (Rb87.mass * self.w_z**2))
         omega_z_squared = 4 * U0_y / (Rb87.mass * self.w_y**2) - 2 * g / self.w_y
         self.omega_z = np.sqrt(max(0, omega_z_squared))  # Ensure non-negative value
+        
+        logging.debug(f"Updated trap frequencies: omega_x = {self.omega_x:.2e}, "
+                      f"omega_y = {self.omega_y:.2e}, omega_z = {self.omega_z:.2e}")
 
     def potential(self, x, y, z):
         U_y = -2 * self.alpha * self.P_y * np.exp(-2 * ((x**2 + z**2) / self.w_y**2)) / (np.pi * self.w_y**2 * c * epsilon_0)
@@ -72,7 +78,13 @@ class DipleTrap:
         return np.column_stack((F_x, F_y, F_z))
 
     def calculate_tilt(self):
-        return np.arctan(g / (self.omega_y**2 * self.w_y))
+        denominator = self.omega_y**2 * self.w_y
+        if denominator == 0:
+            logging.warning("Division by zero encountered in calculate_tilt. Returning 0.")
+            return 0
+        tilt = np.arctan(g / denominator)
+        logging.debug(f"Calculated tilt: {tilt:.2e}")
+        return tilt
 
 class LaserBeam:
     def __init__(self, power, w_x, w_y, wavelength):
@@ -88,8 +100,8 @@ class LaserBeam:
 
 class AtomCloud:
     def __init__(self, N, T, trap):
-        self.N = N
-        self.T = T
+        self.N = max(N, 1)  # Ensure at least one atom
+        self.T = max(T, 1e-9)  # Ensure non-zero temperature (1 nK minimum)
         self.trap = trap
         self.positions = self.initialize_positions()
         self.velocities = self.initialize_velocities()
@@ -101,12 +113,16 @@ class AtomCloud:
 
     def initialize_velocities(self):
         sigma_v = np.sqrt(k * self.T / Rb87.mass)
-        return np.random.normal(0, sigma_v, (self.N, 3))    
+        return np.random.normal(0, sigma_v, (self.N, 3)) 
 
     def update(self, dt):
         forces = self.trap.force(self.positions[:, 0], self.positions[:, 1], self.positions[:, 2])
         self.velocities += forces * dt / Rb87.mass
         self.positions += self.velocities * dt
+
+    def update_temperature(self):
+        kinetic_energy = 0.5 * Rb87.mass * np.sum(self.velocities**2)
+        self.T = max(2 * kinetic_energy / (3 * k * self.N), 1e-9)
 
     def apply_evaporation(self, trap_depth):
         tilt = self.trap.calculate_tilt()
@@ -132,25 +148,29 @@ class AtomCloud:
 
     def apply_light_assisted_collisions(self, P_p, delta):
         n = self.calculate_density()
-        K_2 = 1e-11 * P_p / (1 + 4 * delta**2 / Rb87.gamma_D1**2)
-        loss_rate = K_2 * n
-        survival_prob = np.exp(-loss_rate * dt)
-        mask = np.random.random(self.N) < survival_prob
-        self.positions = self.positions[mask]
-        self.velocities = self.velocities[mask]
-        self.N = len(self.positions)
+        K_2 = 1e-14 * P_p / (1 + 4 * delta**2 / Rb87.gamma_D1**2)  # Reduced collision rate
+        loss_rate = K_2 * n * dt
+        survival_prob = np.exp(-loss_rate)
+        self.N = max(int(self.N * survival_prob), 1)  # Ensure at least one atom remains
+        if self.N < len(self.positions):
+            indices = np.random.choice(len(self.positions), self.N, replace=False)
+            self.positions = self.positions[indices]
+            self.velocities = self.velocities[indices]
 
     def apply_three_body_recombination(self):
         n = self.calculate_density()
-        K_3 = 4e-29
-        loss_rate = K_3 * n**2
+        K_3 = 4e-30  # Reduced three-body loss coefficient
+        loss_rate = K_3 * n**2 * dt
+        survival_prob = np.exp(-loss_rate)
+        self.N = max(int(self.N * survival_prob), 1)  # Ensure at least one atom remains
+        if self.N < len(self.positions):
+            indices = np.random.choice(len(self.positions), self.N, replace=False)
+            self.positions = self.positions[indices]
+            self.velocities = self.velocities[indices]
+    
         heating_rate = K_3 * n**2 * (Rb87.a_s * hbar)**2 / (2 * Rb87.mass)
-        survival_prob = np.exp(-loss_rate * dt)
-        mask = np.random.random(self.N) < survival_prob
-        self.positions = self.positions[mask]
-        self.velocities = self.velocities[mask]
-        self.N = len(self.positions)
         self.T += heating_rate * dt
+        self.update_temperature()
 
     def apply_photon_reabsorption_heating(self, P_p, delta):
         n = self.calculate_density()
@@ -268,6 +288,7 @@ def run_full_sequence(P_y, P_z, P_R, P_p, B_z, B_gradient):
             atoms.apply_light_assisted_collisions(P_p[i], -4.33e9)
             atoms.apply_three_body_recombination()
             atoms.apply_photon_reabsorption_heating(P_p[i], -4.33e9)
+            atoms.update_temperature()
         
         results.append(calculate_observables(atoms))
         trap_frequencies.append((atoms.trap.omega_x, atoms.trap.omega_y, atoms.trap.omega_z))
@@ -290,28 +311,36 @@ def run_full_sequence(P_y, P_z, P_R, P_p, B_z, B_gradient):
     return np.array(results), np.array(trap_frequencies), atoms.trap
 
 class BayesianOptimizer:
-    def __init__(self, parameter_ranges, cost_function, n_initial=20):
+    def __init__(self, parameter_ranges, cost_function, n_initial=20, n_estimators=5):
         self.parameter_ranges = parameter_ranges
         self.cost_function = cost_function
         self.n_initial = n_initial
         self.X = []
         self.y = []
-        self.model = MLPRegressor(hidden_layer_sizes=(64, 64, 64, 64, 64), max_iter=10000)
+        self.n_estimators = n_estimators
+        self.models = [MLPRegressor(hidden_layer_sizes=(64, 64, 64, 64, 64), max_iter=10000) for _ in range(n_estimators)]
         self.scaler = StandardScaler()
 
     def generate_initial_points(self):
         for _ in range(self.n_initial):
             x = [np.random.uniform(low, high) for low, high in self.parameter_ranges]
-            self.X.append(x)
-            self.y.append(self.cost_function(x))
+            y = self.cost_function(x)
+            if np.isfinite(y):
+                self.X.append(x)
+                self.y.append(y)
+        
+        if len(self.X) < 2:
+            raise ValueError("Not enough valid initial points. Try increasing n_initial or adjusting parameter ranges.")
 
     def fit_model(self):
         X_scaled = self.scaler.fit_transform(self.X)
-        self.model.fit(X_scaled, self.y)
+        for model in self.models:
+            model.fit(X_scaled, self.y)
 
     def predict(self, X):
         X_scaled = self.scaler.transform(X.reshape(1, -1))
-        return self.model.predict(X_scaled)[0], self.model.predict(X_scaled, return_std=True)[1][0]
+        predictions = np.array([model.predict(X_scaled) for model in self.models])
+        return np.mean(predictions), np.std(predictions)
 
     def acquisition_function(self, x):
         mean, std = self.predict(x)
@@ -340,14 +369,49 @@ class BayesianOptimizer:
         return self.X[best_idx], self.y[best_idx]
 
 def cost_function(params):
+    logging.debug(f"Cost function called with params: {params}")
+    
     P_y, P_z, P_R, P_p, B_z, B_gradient = expand_parameters(params)
-    results, _ = run_full_sequence(P_y, P_z, P_R, P_p, B_z, B_gradient)
+    results, _, _ = run_full_sequence(P_y, P_z, P_R, P_p, B_z, B_gradient)
     T, N, PSD = results[-1]
-    OD = calculate_optical_depth(T, N)
+    
+    logging.debug(f"Simulation results: N={N:.2e}, T={T:.2e}, PSD={PSD:.2e}")
+    
+    # Safeguards against unphysical results
+    if N < 1 or T < 1e-9 or np.isnan(T) or np.isnan(N) or np.isinf(T) or np.isinf(N):
+        logging.warning(f"Unphysical results: N={N:.2e}, T={T:.2e}")
+        return 1e10  # Return a large finite number instead of np.inf
+    
+    try:
+        OD = calculate_optical_depth(T, N)
+        logging.debug(f"Calculated OD: {OD:.2e}")
+    except Exception as e:
+        logging.warning(f"Error calculating optical depth: {e}")
+        return 1e10
+    
     alpha = 0.5
     N1 = 1000
-    f = 2 / (np.exp(N1/N) + 1) if N > 0 else 0
-    return -f * OD**3 * N**(alpha - 9/5)
+
+    try:
+        # Use log-sum-exp trick to avoid overflow
+        log_sum_exp = np.logaddexp(0, -N1/N)
+        f = 2 / (1 + np.exp(log_sum_exp))
+        
+        # Use np.log and np.exp to avoid overflow in power operation
+        log_cost = np.log(f) + 3 * np.log(OD) + (alpha - 9/5) * np.log(N)
+        cost = -np.exp(log_cost)
+        
+        logging.debug(f"Calculated cost: {cost:.2e}")
+        
+        # Check if the cost is valid
+        if np.isnan(cost) or np.isinf(cost):
+            logging.warning(f"Invalid cost calculated: {cost}")
+            return 1e10
+        
+        return cost
+    except Exception as e:
+        logging.warning(f"Error in cost calculation: {e}")
+        return 1e10
 
 def expand_parameters(params):
     P_y = np.interp(np.linspace(0, 1, 11), [0, 0.25, 0.5, 0.75, 1], params[0:5])
@@ -474,10 +538,31 @@ def run_optimization(n_iterations=100):
         (0, 1e-3)] * 5 + [  # B_z range (5)
         (0, 1e-2)]  # B_gradient range
 
-    optimizer = BayesianOptimizer(parameter_ranges, cost_function, n_initial=20)
-    best_params, best_cost = optimizer.optimize(n_iterations)
-    
-    return best_params, best_cost, optimizer
+    try:
+        optimizer = BayesianOptimizer(parameter_ranges, cost_function, n_initial=20, n_estimators=5)
+        
+        for i in range(n_iterations):
+            try:
+                best_params, best_cost = optimizer.optimize(1)  # Run one iteration at a time
+                logging.info(f"Iteration {i+1}: Best cost = {best_cost:.2e}")
+                
+                # Log some details about the best parameters
+                P_y, P_z, P_R, P_p, B_z, B_gradient = expand_parameters(best_params)
+                logging.info(f"Best parameters: P_y_max = {max(P_y):.2e}, P_z_max = {max(P_z):.2e}, "
+                             f"P_R_max = {max(P_R):.2e}, P_p_max = {max(P_p):.2e}, "
+                             f"B_z_max = {max(B_z):.2e}, B_gradient = {B_gradient:.2e}")
+                
+                # Run a simulation with the best parameters and log the results
+                results, _, _ = run_full_sequence(P_y, P_z, P_R, P_p, B_z, B_gradient)
+                T, N, PSD = results[-1]
+                logging.info(f"Simulation results: N = {N:.2e}, T = {T:.2e}, PSD = {PSD:.2e}")
+            except Exception as e:
+                logging.error(f"Error in optimization iteration {i+1}: {e}")
+        
+        return best_params, best_cost, optimizer
+    except Exception as e:
+        logging.error(f"Error in optimization process: {e}")
+        raise
 
 def initial_simulation_run():
     P_y_init = [1.0, 0.8, 0.6, 0.4, 0.2, 0.1, 0.05, 0.02, 0.01, 0.005, 0.001]
@@ -495,17 +580,18 @@ def initial_simulation_run():
 
 if __name__ == "__main__":
     print("Running initial simulation...")
-    initial_results, initial_trap = initial_simulation_run()
-    
+    initial_results, initial_trap_frequencies, initial_trap = initial_simulation_run()
+
     print("Starting optimization process...")
     best_params, best_cost, optimizer = run_optimization(n_iterations=100)
     
     print("Running simulation with optimized parameters...")
+    # Run simulation with optimized parameters
     P_y_opt, P_z_opt, P_R_opt, P_p_opt, B_z_opt, B_gradient_opt = expand_parameters(best_params)
     optimized_results, optimized_trap_frequencies, optimized_trap = run_full_sequence(P_y_opt, P_z_opt, P_R_opt, P_p_opt, B_z_opt, B_gradient_opt)
     
-    print("Validating optimized results...")
-    validate_simulation(optimized_results, P_y_opt, P_z_opt, P_R_opt, P_p_opt, B_z_opt, optimized_trap)
+    print("\nOptimized simulation results:")
+    validate_simulation(optimized_results, optimized_trap_frequencies, P_y_opt, P_z_opt, P_R_opt, P_p_opt, B_z_opt, optimized_trap)
     
     print("Plotting optimization progress...")
     plot_optimization_progress(optimizer)
