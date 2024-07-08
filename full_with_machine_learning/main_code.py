@@ -501,6 +501,11 @@ def run_full_sequence(P_y, P_z, P_R, P_p, B_z):
             np.array(cooling_efficiencies), np.array(condensate_fractions))
 
 
+
+
+
+
+
 class BayesianOptimizer:
     def __init__(self, parameter_ranges, cost_function, n_initial=20, n_estimators=5):
         self.parameter_ranges = parameter_ranges
@@ -842,12 +847,13 @@ def run_optimization(n_iterations=100):
         logging.error(f"Error in optimization process: {e}")
         raise
 
+
 def initial_simulation_run():
-    P_y_init = [2.0, 1.8, 1.6, 1.4, 1.2] + [1.0] * 6
-    P_z_init = [2.0, 1.8, 1.6, 1.4, 1.2] + [1.0] * 6
-    P_R_init = [0.2, 0.15, 0.1, 0.05, 0.01] + [0] * 6
-    P_p_init = [0.2, 0.15, 0.1, 0.05, 0.01] + [0] * 6
-    B_z_init = [1e-4, 8e-5, 6e-5, 4e-5, 2e-5]+ [1e-5] * 6
+    P_y_init = [1.0, 0.6, 0.4, 0.15, 0.02, 0.01, 0.008, 0.02, 0.01, 0.0075, 0.005]
+    P_z_init = [0.01, 0.012, 0.01, 0.025, 0.02, 0.01, 0.008, 0.06, 0.5, 0.015, 0.003]
+    P_R_init = [10, 40, 30, 0, 10, 1, 0, 0, 0, 0, 0]
+    P_p_init = [0.008, 0.009, 0.01, 0.01, 0.001, 0.005, 0, 0, 0, 0, 0]
+    B_z_init = [3.25e-4, 3.15e-4, 3.25e-4, 3.2e-4, 2.8e-4, 3.05e-4, 3.05e-4, 3.05e-4, 3.05e-4, 3.05e-4, 3.05e-4]
 
     results, trap_frequencies, trap, cooling_efficiencies, condensate_fractions = run_full_sequence(P_y_init, P_z_init, P_R_init, P_p_init, B_z_init)
     
