@@ -3,7 +3,6 @@ from scipy.constants import h, hbar, k, atomic_mass, mu_0, g, c, epsilon_0
 from scipy.optimize import minimize
 from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
-from scipy.optimize import curve_fit
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import logging
@@ -37,13 +36,6 @@ class Rb87:
     def calculate_polarizability(cls, wavelength):
         # This is a simplified calculation and might need to be adjusted for accuracy
         return 5.3e-39  # m^3, approximate value for 1064 nm
-    
-    @classmethod
-    def calculate_K3(cls, T):
-        K3_0 = 4.3e-29  # cm^6/s for Rb-87 in |2, -2⟩ state
-        T_scale = 100e-6  # 100 μK
-        return K3_0 * (1 + (T / T_scale)**2) * 1e-12  # Convert to m^6/s
-
 
 # Simulation parameters
 N_atoms_initial = int(2.7e5)
@@ -58,7 +50,7 @@ class DipleTrap:
         self.w_z = w_z
         self.wavelength = wavelength
         self.k = 2 * np.pi / wavelength
-        self.alpha = Rb87.calculate_polarizability(wavelength)
+        self.alpha = 5.4e-39  # Polarizability of Rb87 at 1064 nm
         self.update_trap_frequencies()
 
     def update_trap_frequencies(self):
@@ -77,7 +69,6 @@ class DipleTrap:
         U_z = -2 * self.alpha * self.P_z * np.exp(-2 * ((x**2 + y**2) / self.w_z**2)) / (np.pi * self.w_z**2 * c * epsilon_0)
         U_gravity = Rb87.mass * g * z
         return U_y + U_z + U_gravity
-
 
     def force(self, x, y, z):
         F_x = -4 * self.alpha * self.P_y * x * np.exp(-2 * (x**2 + z**2) / self.w_y**2) / (np.pi * self.w_y**4 * c * epsilon_0) \
@@ -107,7 +98,6 @@ class LaserBeam:
         x, y, _ = positions.T
         return 2 * self.power / (np.pi * self.w_x * self.w_y) * np.exp(-2 * (x**2 / self.w_x**2 + y**2 / self.w_y**2))
 
-
 class AtomCloud:
     def __init__(self, N, T, trap):
         self.N = int(max(N, 1))  # Ensure at least one atom
@@ -135,10 +125,6 @@ class AtomCloud:
         kinetic_energy = 0.5 * Rb87.mass * np.sum(self.velocities**2)
         self.T = max(2 * kinetic_energy / (3 * k * self.N), 1e-9)
 
-    def update_velocities(self):
-        sigma_v = np.sqrt(k * self.T / Rb87.mass)
-        self.velocities = np.random.normal(0, sigma_v, (self.N, 3))
-
     def apply_evaporation(self, trap_depth):
         tilt = self.trap.calculate_tilt()
         kinetic_energy = 0.5 * Rb87.mass * np.sum(self.velocities**2, axis=1)
@@ -163,59 +149,29 @@ class AtomCloud:
 
     def apply_light_assisted_collisions(self, P_p, delta):
         n = self.calculate_density()
-        n = min(n, 1e19)  # Cap density at a realistic maximum value
-        
-        # Adjust intensity calculation
-        beam_area = np.pi * self.trap.w_y * self.trap.w_z
-        intensity = min(P_p / beam_area, 1e3)  # Cap intensity at 1000 W/m^2
-        intensity_mW_cm2 = intensity * 1e-1  # Convert to mW/cm^2
-    
-        K_2 = photoassociation_loss_rate(delta, intensity_mW_cm2)
-        
+        K_2 = 1e-14 * P_p / (1 + 4 * delta**2 / Rb87.gamma_D1**2)  # Reduced collision rate
         loss_rate = K_2 * n * dt
         survival_prob = np.exp(-loss_rate)
-        new_N = int(self.N * survival_prob)
-        self.N = max(new_N, 1)  # Ensure at least 1 atom remains
-
-        # Only update positions and velocities if atoms are actually lost
-        if new_N < self.N:
-            if len(self.positions) > new_N:
-                indices = np.random.choice(len(self.positions), new_N, replace=False)
-                self.positions = self.positions[indices]
-                self.velocities = self.velocities[indices]
-
-    def apply_three_body_recombination(self):
-        n = self.calculate_density()
-        K_3 = Rb87.calculate_K3(self.T)
-        loss_rate = K_3 * n**2 * dt
-        survival_prob = np.exp(-loss_rate)
-        initial_N = self.N
         self.N = max(int(self.N * survival_prob), 1)  # Ensure at least one atom remains
-        atoms_lost = initial_N - self.N
-        
         if self.N < len(self.positions):
             indices = np.random.choice(len(self.positions), self.N, replace=False)
             self.positions = self.positions[indices]
             self.velocities = self.velocities[indices]
 
-        heating_rate = K_3 * n**2 * (Rb87.a_s * hbar)**2 / (2 * Rb87.mass) * 1e3
+    def apply_three_body_recombination(self):
+        n = self.calculate_density()
+        K_3 = 4e-30  # Reduced three-body loss coefficient
+        loss_rate = K_3 * n**2 * dt
+        survival_prob = np.exp(-loss_rate)
+        self.N = max(int(self.N * survival_prob), 1)  # Ensure at least one atom remains
+        if self.N < len(self.positions):
+            indices = np.random.choice(len(self.positions), self.N, replace=False)
+            self.positions = self.positions[indices]
+            self.velocities = self.velocities[indices]
+    
+        heating_rate = K_3 * n**2 * (Rb87.a_s * hbar)**2 / (2 * Rb87.mass)
         self.T += heating_rate * dt
-
-        # Add small probability of hot atoms remaining trapped
-        hot_atom_prob = 0.01
-        hot_atom_heating = atoms_lost * hot_atom_prob * 10 * k * self.T / (self.N * 3 * k)
-        self.T += hot_atom_heating
-
         self.update_temperature()
-
-    def apply_evaporative_cooling(self, trap_depth):
-        # Simple evaporative cooling model
-        eta = 10  # truncation parameter
-        evap_prob = np.exp(-eta * self.T / trap_depth)
-        atoms_to_remove = int(self.N * evap_prob)
-        self.N -= atoms_to_remove
-        self.T *= 1 - evap_prob / 3  # Cooling effect
-        
 
     def apply_photon_reabsorption_heating(self, P_p, delta):
         n = self.calculate_density()
@@ -232,53 +188,17 @@ class AtomCloud:
         # This is a simplified approach; you may need to adjust it based on your specific requirements
         self.light_shift += zeeman_shift
         
-    # In the AtomCloud class, modify the calculate_density method:
     def calculate_density(self):
-        omega = (self.trap.omega_x * self.trap.omega_y * self.trap.omega_z)**(1/3)
-        return self.N * (Rb87.mass * omega / (2 * np.pi * k * self.T))**(3/2)
-        
-
-class TiltedDipleTrap(DipleTrap):
-    def __init__(self, P_y, P_z, w_y, w_z, wavelength, tilt_angle):
-        super().__init__(P_y, P_z, w_y, w_z, wavelength)
-        self.tilt_angle = tilt_angle
-    
-    def potential(self, x, y, z):
-        x_tilted = x * np.cos(self.tilt_angle) + z * np.sin(self.tilt_angle)
-        z_tilted = -x * np.sin(self.tilt_angle) + z * np.cos(self.tilt_angle)
-        return super().potential(x_tilted, y, z_tilted)
-
-
-
-def photoassociation_loss_rate(delta, intensity):
-    gamma = 2 * np.pi * 5.75e6  # Natural linewidth of Rb87 D1 line
-    saturation_intensity = 4.484  # mW/cm^2 for Rb87 D1 line
-    optimal_detuning = -4.33e9  # -4.33 GHz, optimal detuning from main_ref.tex
-    detuning_width = 50e6  # 50 MHz width around optimal detuning
-    
-    # Convert intensity to saturation parameter
-    s = intensity / saturation_intensity
-    
-    # Calculate base rate
-    base_rate = 1e-14 * (s / (1 + s + 4 * (delta / gamma)**2))**2
-    
-    # Apply detuning-dependent scaling
-    detuning_factor = np.exp(-(delta - optimal_detuning)**2 / (2 * detuning_width**2))
-    
-    return base_rate * detuning_factor
-
-
-
-
-        
-
-
+        omega = max(1e-10, self.trap.omega_x * self.trap.omega_y * self.trap.omega_z)  # Prevent division by zero
+        T = max(1e-10, self.T)  # Prevent division by zero
+        vol = (2 * np.pi * k * T / (Rb87.mass * omega))**1.5
+        return self.N / vol
 
 def raman_cooling(atoms, P_R, P_p, delta_R, sigma_minus_beam, pi_beam):
     atoms.apply_light_shift(P_p, -4.33e9, sigma_minus_beam)
     
     raman_rate = P_R * 1e3
-    v_recoil = Rb87.vr_D1
+    v_recoil = h / (Rb87.wavelength_D1 * Rb87.mass)
     v_res = (delta_R - atoms.light_shift) / (2 * np.pi / Rb87.wavelength_D1)
     
     I_sigma = sigma_minus_beam.intensity(atoms.positions)
@@ -291,18 +211,11 @@ def raman_cooling(atoms, P_R, P_p, delta_R, sigma_minus_beam, pi_beam):
     v_magnitude = np.linalg.norm(atoms.velocities, axis=1)
     
     cooling_prob = raman_rate * dt * (Omega_eff / (1 + 4 * (v_magnitude - v_res)**2 / Rb87.gamma_D1**2 + 4 * delta_R_eff**2 / Rb87.gamma_D1**2))
-    cooling_mask = np.random.random(atoms.N) < cooling_prob
+    cooling_mask = np.random.random(int(atoms.N)) < cooling_prob  # Convert atoms.N to integer
+
     
     cooling_direction = atoms.velocities[cooling_mask] / np.linalg.norm(atoms.velocities[cooling_mask], axis=1)[:, np.newaxis]
     atoms.velocities[cooling_mask] -= v_recoil * cooling_direction
-    
-    # Improved subrecoil cooling model
-    v_eff_recoil = np.sqrt(8 * Rb87.Er_D1 / Rb87.mass)
-    subrecoil_mask = v_magnitude < v_eff_recoil
-    cooling_strength = np.exp(-(v_magnitude[subrecoil_mask] / v_eff_recoil)**2)
-    atoms.velocities[subrecoil_mask] *= (1 - cooling_strength[:, np.newaxis])
-    
-    atoms.update_temperature()
 
 def optical_pumping(atoms, P_p, delta, sigma_minus_beam):
     I = sigma_minus_beam.intensity(atoms.positions)
@@ -315,33 +228,26 @@ def optical_pumping(atoms, P_p, delta, sigma_minus_beam):
     festina_lente_factor = 1 / (1 + reabsorption_prob * gamma_sc / atoms.trap.omega_x)
     
     scattering_prob = gamma_sc * dt * festina_lente_factor
-    scattering_mask = np.random.random(atoms.N) < scattering_prob
+    scattering_mask = np.random.random(atoms.N) < scattering_prob  # Change to atoms.N
     
-    recoil_velocity = Rb87.vr_D1
+    recoil_velocity = h / (Rb87.wavelength_D1 * Rb87.mass)
     recoil_directions = np.random.randn(np.sum(scattering_mask), 3)
     recoil_directions /= np.linalg.norm(recoil_directions, axis=1)[:, np.newaxis]
     
     atoms.velocities[scattering_mask] += recoil_velocity * recoil_directions
-    
-    # Bosonic stimulation effect
-    v_magnitude = np.linalg.norm(atoms.velocities, axis=1)
-    ground_state_mask = v_magnitude < Rb87.vr_D1
-    stimulation_factor = 1 + atoms.calculate_density() * Rb87.wavelength_D1**3
-    atoms.velocities[ground_state_mask] *= np.exp(-stimulation_factor * dt)
-    
-    atoms.update_temperature()
 
 def mot_loading_and_compression(atoms, trap, P_y, P_z, B_z):
     # 88 ms of MOT loading and initial compression
     for _ in range(int(0.088 / dt)):
-        atoms.velocities *= 0.989  # Increased cooling rate
+        # Simulate MOT loading and compression
+        atoms.velocities *= 0.99  # Simple velocity damping
         atoms.update(dt)
-        atoms.update_temperature()
+        atoms.T = np.sum(atoms.velocities**2) * Rb87.mass / (3 * k * atoms.N)
     
     # Apply gray molasses for 1 ms
     atoms.apply_gray_molasses(0.001)
     
-    # 10 ms ramp of trap beam powers with some heating
+    # 10 ms ramp of trap beam powers
     initial_P_y, initial_P_z = trap.P_y, trap.P_z
     for i in range(int(0.01 / dt)):
         t = i * dt / 0.01
@@ -349,10 +255,9 @@ def mot_loading_and_compression(atoms, trap, P_y, P_z, B_z):
         trap.P_z = initial_P_z * (1 - t) + P_z[0] * t
         trap.update_trap_frequencies()
         atoms.update(dt)
-        atoms.T *= 1.001  # Small heating during compression
     
     # 1 ms magnetic field adjustment
-    initial_B_z = B_z[0]
+    initial_B_z = B_z[0]  # Assuming B_z[0] is the initial magnetic field
     for i in range(int(0.001 / dt)):
         t = i * dt / 0.001
         current_B_z = initial_B_z * (1 - t) + B_z[0] * t
@@ -360,26 +265,9 @@ def mot_loading_and_compression(atoms, trap, P_y, P_z, B_z):
         atoms.update(dt)
     
     # Adjust atom number to match reference
-    atoms.N = int(2.7e5)
+    atoms.N = 2.7e5
     
     return atoms
-
-
-def calculate_cooling_efficiency(results):
-    N = np.array([max(1e-10, result[1]) for result in results])  # Ensure N > 0
-    PSD = np.array([max(1e-10, result[2]) for result in results])  # Ensure PSD > 0
-    
-    log_N = np.log(N)
-    log_PSD = np.log(PSD)
-    
-    diff_log_N = np.diff(log_N)
-    diff_log_PSD = np.diff(log_PSD)
-    
-    # Avoid division by zero or very small numbers
-    epsilon = 1e-10
-    gamma = -diff_log_PSD / (diff_log_N + epsilon)
-    
-    return gamma
 
 def calculate_delta_R(B_z):
     return 2 * Rb87.mu_B * Rb87.g_F * B_z / hbar
@@ -389,7 +277,6 @@ def calculate_trap_depth(trap):
 
 def calculate_optical_depth(T, N):
     return N * (h**2 / (2 * np.pi * Rb87.mass * k * T))**(2/3)
-
 
 
 def calculate_observables(atoms):
@@ -403,46 +290,8 @@ def calculate_observables(atoms):
     PSD = n * (h**2 / (2*np.pi*Rb87.mass*k*T))**1.5
     return T, N, PSD
 
-
-def detect_bec(atoms):
-    v_magnitude = np.linalg.norm(atoms.velocities, axis=1)
-    
-    def bimodal_dist(v, N_th, T_th, N_bec, w_bec):
-        return (N_th * v**2 * np.exp(-v**2 / (2 * k * T_th / Rb87.mass)) +
-                N_bec * np.maximum(0, 1 - v**2 / w_bec**2)**(3/2))
-    
-    hist, bin_edges = np.histogram(v_magnitude, bins=50)
-    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-    
-    try:
-        # Add bounds to prevent negative or zero values
-        bounds = ([0, 1e-9, 0, 1e-9], [np.inf, np.inf, np.inf, np.inf])
-        popt, _ = curve_fit(bimodal_dist, bin_centers, hist, 
-                            p0=[atoms.N, atoms.T, 0, Rb87.vr_D1],
-                            bounds=bounds,
-                            maxfev=10000)  # Increase max function evaluations
-        N_th, T_th, N_bec, w_bec = popt
-        condensate_fraction = N_bec / (N_th + N_bec)
-    except RuntimeError as e:
-        logging.warning(f"Curve fitting failed: {e}")
-        condensate_fraction = 0
-    except ValueError as e:
-        logging.warning(f"Invalid value in curve fitting: {e}")
-        condensate_fraction = 0
-    
-    return condensate_fraction
-
-
-
-
-
-
-
-
-
 def run_full_sequence(P_y, P_z, P_R, P_p, B_z):
-    tilt_angle = 17 * np.pi / 180  # 17 degrees tilt
-    trap = TiltedDipleTrap(P_y[0], P_z[0], 18e-6, 14e-6, 1064e-9, tilt_angle)
+    trap = DipleTrap(P_y[0], P_z[0], 18e-6, 14e-6, 1064e-9)
     atoms = AtomCloud(N_atoms_initial, T_initial, trap)
     
     sigma_minus_beam = LaserBeam(P_p[0], 30e-6, 1e-3, Rb87.wavelength_D1)
@@ -450,12 +299,12 @@ def run_full_sequence(P_y, P_z, P_R, P_p, B_z):
     
     results = []
     trap_frequencies = []
-    cooling_efficiencies = []
-    condensate_fractions = []
     
     # MOT loading and compression (99 ms)
     atoms = mot_loading_and_compression(atoms, trap, P_y, P_z, B_z)
+
     results.append(calculate_observables(atoms))
+    trap_frequencies.append((trap.omega_x, trap.omega_y, trap.omega_z))
     #print(f"After MOT: N = {atoms.N:.2e}, T = {atoms.T*1e6:.2f} μK")
     
     # Five stages of Raman cooling (63 ms each)
@@ -473,12 +322,11 @@ def run_full_sequence(P_y, P_z, P_R, P_p, B_z):
             atoms.apply_light_assisted_collisions(P_p[i], -4.33e9)
             atoms.apply_three_body_recombination()
             atoms.apply_photon_reabsorption_heating(P_p[i], -4.33e9)
-            atoms.apply_evaporative_cooling(calculate_trap_depth(atoms.trap))
+            atoms.update_temperature()
         
         results.append(calculate_observables(atoms))
         trap_frequencies.append((atoms.trap.omega_x, atoms.trap.omega_y, atoms.trap.omega_z))
-        #print(f"After Raman cooling {i}: N = {atoms.N:.2e}, T = {atoms.T*1e6:.2f} μK")
-          
+        
     # Six stages of evaporation (27 ms each)
     for i in range(5, 11):
         atoms.trap.P_y, atoms.trap.P_z = P_y[i], P_z[i]
@@ -488,17 +336,13 @@ def run_full_sequence(P_y, P_z, P_R, P_p, B_z):
             atoms.update(dt)
             atoms.apply_evaporation(calculate_trap_depth(atoms.trap))
             atoms.apply_three_body_recombination()
+            atoms.update_temperature()
         
         results.append(calculate_observables(atoms))
         trap_frequencies.append((atoms.trap.omega_x, atoms.trap.omega_y, atoms.trap.omega_z))
         #print(f"After evaporation stage {i-4}: N = {atoms.N:.2e}, T = {atoms.T*1e6:.2f} μK")
     
-    for i in range(len(results) - 1):
-        cooling_efficiencies.append(calculate_cooling_efficiency(results[i:i+2]))
-        condensate_fractions.append(detect_bec(atoms))
-    
-    return (np.array(results), np.array(trap_frequencies), atoms.trap,
-            np.array(cooling_efficiencies), np.array(condensate_fractions))
+    return np.array(results), np.array(trap_frequencies), atoms.trap
 
 
 class BayesianOptimizer:
@@ -563,7 +407,7 @@ def cost_function(params):
     logging.debug(f"Cost function called with params: {params}")
     
     P_y, P_z, P_R, P_p, B_z = expand_parameters(params)
-    results, _, _, _, _ = run_full_sequence(P_y, P_z, P_R, P_p, B_z)
+    results, _, _ = run_full_sequence(P_y, P_z, P_R, P_p, B_z)
     T, N, PSD = results[-1]
     
     logging.debug(f"Simulation results: N={N:.2e}, T={T:.2e}, PSD={PSD:.2e}")
@@ -669,44 +513,24 @@ def plot_control_waveforms(P_y, P_z, P_R, P_p, B_z):
     plt.show()
 
 def plot_trap_and_atomic_properties(results, trap_frequencies):
-    t = np.array([result[0] for result in results])
-    T = np.array([result[1] for result in results])
-    N = np.array([result[2] for result in results])
+    t = np.linspace(0, 0.575, len(results))
     
-    # Ensure t, T, N, and trap_frequencies have the same length
-    min_length = min(len(results), len(trap_frequencies))
-    t = t[:min_length]
-    T = T[:min_length]
-    N = N[:min_length]
-    trap_frequencies = trap_frequencies[:min_length]
-
-    
-    # Calculate PSD if needed (you may need to adjust this calculation)
-    PSD = calculate_psd(T, N, trap_frequencies)  # You'll need to implement this function
-
     fig, axs = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
-
-    omega_x, omega_y, omega_z = trap_frequencies.T
     
-    # Ensure t and trap frequencies have the same length
-    t_freq = np.linspace(t[0], t[-1], len(omega_x))
-
-    axs[0].semilogy(t_freq, omega_x / (2*np.pi), 'r-', label='ν_x')
-    axs[0].semilogy(t_freq, omega_y / (2*np.pi), 'g-', label='ν_y')
-    axs[0].semilogy(t_freq, omega_z / (2*np.pi), 'b-', label='ν_z')
-    axs[0].set_ylabel('Trap Frequency (Hz)')
+    omega_x, omega_y, omega_z = trap_frequencies.T
+    axs[0].semilogy(t, omega_x / (2*np.pi), 'r-', label='ν_x')
+    axs[0].semilogy(t, omega_y / (2*np.pi), 'g-', label='ν_y')
+    axs[0].semilogy(t, omega_z / (2*np.pi), 'b-', label='ν_z')
+    axs[0].set_ylabel('Trap Frequencies (Hz)')
     axs[0].legend()
-    axs[0].grid(True)
-
-    axs[1].semilogy(t, T, 'r-', label='Temperature')
-    axs[1].semilogy(t, N, 'g-', label='Atom Number')
-    if PSD is not None:
-        axs[1].semilogy(t, PSD, 'b-', label='PSD')
+    
+    collision_rates = [calculate_collision_rate(result) for result in results]
+    axs[1].semilogy(t, collision_rates, 'k-', label='ν_c')
+    axs[1].set_ylabel('Collision Rate (Hz)')
     axs[1].set_xlabel('Time (s)')
-    axs[1].set_ylabel('Value')
     axs[1].legend()
-    axs[1].grid(True)
-
+    
+    plt.suptitle('Trap and Atomic Properties')
     plt.tight_layout()
     plt.show()
 
@@ -717,28 +541,6 @@ def calculate_collision_rate(result):
     sigma = 8 * np.pi * Rb87.a_s**2
     return n * sigma * v_rms
 
-def calculate_psd(T, N, trap_frequencies):
-    omega_x, omega_y, omega_z = trap_frequencies.T
-    omega_mean = np.cbrt(omega_x * omega_y * omega_z)
-    
-    # Print shapes for debugging
-    print(f"Shape of N: {N.shape}")
-    print(f"Shape of T: {T.shape}")
-    print(f"Shape of omega_mean: {omega_mean.shape}")
-    
-    # Ensure all arrays have the same length
-    min_length = min(len(N), len(T), len(omega_mean))
-    N = N[:min_length]
-    T = T[:min_length]
-    omega_mean = omega_mean[:min_length]
-    
-    # Avoid division by zero
-    T = np.maximum(T, 1e-10)
-    
-    return N * (hbar * omega_mean / (k * T))**3
-
-
-
 def plot_optimization_progress(optimizer):
     plt.figure(figsize=(12, 6))
     plt.plot(range(len(optimizer.y)), -np.array(optimizer.y), 'b-')
@@ -748,42 +550,7 @@ def plot_optimization_progress(optimizer):
     plt.grid(True)
     plt.show()
 
-
-def plot_results(results, cooling_efficiencies, condensate_fractions):
-    T, N, PSD = results.T
-    
-    fig, axs = plt.subplots(2, 2, figsize=(12, 10))
-    
-    # PSD vs N
-    axs[0, 0].loglog(N, PSD, 'b-')
-    axs[0, 0].set_xlabel('Atom Number (N)')
-    axs[0, 0].set_ylabel('Phase Space Density (PSD)')
-    axs[0, 0].set_title('Cooling Performance: PSD vs N')
-    
-    # Cooling efficiency
-    axs[0, 1].plot(range(len(cooling_efficiencies)), cooling_efficiencies, 'r-')
-    axs[0, 1].set_xlabel('Cooling Stage')
-    axs[0, 1].set_ylabel('Cooling Efficiency (γ)')
-    axs[0, 1].set_title('Cooling Efficiency vs Stage')
-    
-    # Temperature vs time
-    t = np.arange(len(T)) * 0.063  # Assuming 63 ms per stage
-    axs[1, 0].semilogy(t, T, 'g-')
-    axs[1, 0].set_xlabel('Time (s)')
-    axs[1, 0].set_ylabel('Temperature (K)')
-    axs[1, 0].set_title('Temperature vs Time')
-    
-    # Condensate fraction
-    axs[1, 1].plot(range(len(condensate_fractions)), condensate_fractions, 'm-')
-    axs[1, 1].set_xlabel('Cooling Stage')
-    axs[1, 1].set_ylabel('Condensate Fraction')
-    axs[1, 1].set_title('Condensate Fraction vs Stage')
-    
-    plt.tight_layout()
-    plt.show()
-
-
-def validate_simulation(results, trap_frequencies, P_y, P_z, P_R, P_p, B_z, trap, cooling_efficiencies, condensate_fractions):
+def validate_simulation(results, trap_frequencies, P_y, P_z, P_R, P_p, B_z, trap):
     if np.any(np.isnan(results)) or np.any(np.isinf(results)):
         logging.warning("Results contain NaN or Inf values. Skipping plot_psd_vs_n.")
     else:
@@ -794,9 +561,6 @@ def validate_simulation(results, trap_frequencies, P_y, P_z, P_R, P_p, B_z, trap
     
     plot_control_waveforms(P_y, P_z, P_R, P_p, B_z)
     plot_trap_and_atomic_properties(results, trap_frequencies)
-    # Plot the results
-    plot_results(results, cooling_efficiencies, condensate_fractions)
-
     
     T_final, N_final, PSD_final = results[-1]
     condensate_fraction = estimate_condensate_fraction(T_final, N_final, trap)
@@ -831,7 +595,7 @@ def run_optimization(n_iterations=100):
                              f"P_R_max = {max(P_R):.2e}, P_p_max = {max(P_p):.2e}, B_z_max = {max(B_z):.2e}")
                 
                 # Run a simulation with the best parameters and log the results
-                results, trap_frequencies, final_trap, _, _ = run_full_sequence(P_y, P_z, P_R, P_p, B_z)
+                results, trap_frequencies, final_trap = run_full_sequence(P_y, P_z, P_R, P_p, B_z)
                 T, N, PSD = results[-1]
                 logging.info(f"Simulation results: N = {N:.2e}, T = {T:.2e}, PSD = {PSD:.2e}")
             except Exception as e:
@@ -849,9 +613,9 @@ def initial_simulation_run():
     P_p_init = [0.2, 0.15, 0.1, 0.05, 0.01] + [0] * 6
     B_z_init = [1e-4, 8e-5, 6e-5, 4e-5, 2e-5]+ [1e-5] * 6
 
-    results, trap_frequencies, trap, cooling_efficiencies, condensate_fractions = run_full_sequence(P_y_init, P_z_init, P_R_init, P_p_init, B_z_init)
+    results, trap_frequencies, trap = run_full_sequence(P_y_init, P_z_init, P_R_init, P_p_init, B_z_init)
     
-    validate_simulation(results, trap_frequencies, P_y_init, P_z_init, P_R_init, P_p_init, B_z_init, trap, cooling_efficiencies, condensate_fractions)
+    validate_simulation(results, trap_frequencies, P_y_init, P_z_init, P_R_init, P_p_init, B_z_init, trap)
     
     return results, trap_frequencies, trap
 
@@ -865,10 +629,10 @@ if __name__ == "__main__":
     print("Running simulation with optimized parameters...")
     # Run simulation with optimized parameters
     P_y_opt, P_z_opt, P_R_opt, P_p_opt, B_z_opt, B_gradient_opt = expand_parameters(best_params)
-    optimized_results, optimized_trap_frequencies, optimized_trap, optimized_cooling_efficiencies, optimized_condensate_fractions = run_full_sequence(P_y_opt, P_z_opt, P_R_opt, P_p_opt, B_z_opt, B_gradient_opt)
+    optimized_results, optimized_trap_frequencies, optimized_trap = run_full_sequence(P_y_opt, P_z_opt, P_R_opt, P_p_opt, B_z_opt, B_gradient_opt)
     
     print("\nOptimized simulation results:")
-    validate_simulation(optimized_results, optimized_trap_frequencies, P_y_opt, P_z_opt, P_R_opt, P_p_opt, B_z_opt, optimized_trap, optimized_cooling_efficiencies, optimized_condensate_fractions)
+    validate_simulation(optimized_results, optimized_trap_frequencies, P_y_opt, P_z_opt, P_R_opt, P_p_opt, B_z_opt, optimized_trap)
     
     print("Plotting optimization progress...")
     plot_optimization_progress(optimizer)

@@ -184,6 +184,16 @@ class AtomCloud:
                 self.positions = self.positions[indices]
                 self.velocities = self.velocities[indices]
 
+        # Print diagnostic information
+        print(f"Light-assisted collision diagnostics:")
+        print(f"  Delta: {delta:.2e} Hz")
+        print(f"  Intensity: {intensity_mW_cm2:.2e} mW/cm^2")
+        print(f"  Density: {n:.2e} m^-3")
+        print(f"  K_2: {K_2:.2e} m^3/s")
+        print(f"  Loss rate: {loss_rate:.2e} s^-1")
+        print(f"  Survival probability: {survival_prob:.4f}")
+        print(f"  New atom number: {self.N}")
+
     def apply_three_body_recombination(self):
         n = self.calculate_density()
         K_3 = Rb87.calculate_K3(self.T)
@@ -207,6 +217,19 @@ class AtomCloud:
         self.T += hot_atom_heating
 
         self.update_temperature()
+
+        # Print diagnostic information
+        print(f"Three-body recombination diagnostics:")
+        print(f"  Initial atom number: {initial_N}")
+        print(f"  K_3: {K_3:.2e} m^6/s")
+        print(f"  Density: {n:.2e} m^-3")
+        print(f"  Loss rate: {loss_rate:.2e} s^-1")
+        print(f"  Survival probability: {survival_prob:.4f}")
+        print(f"  Atoms lost: {atoms_lost}")
+        print(f"  New atom number: {self.N}")
+        print(f"  Heating rate: {heating_rate:.2e} K/s")
+        print(f"  Hot atom heating: {hot_atom_heating:.2e} K")
+        print(f"  New temperature: {self.T*1e6:.2f} μK")
 
     def apply_evaporative_cooling(self, trap_depth):
         # Simple evaporative cooling model
@@ -234,8 +257,10 @@ class AtomCloud:
         
     # In the AtomCloud class, modify the calculate_density method:
     def calculate_density(self):
-        omega = (self.trap.omega_x * self.trap.omega_y * self.trap.omega_z)**(1/3)
-        return self.N * (Rb87.mass * omega / (2 * np.pi * k * self.T))**(3/2)
+        omega = max(1e-10, self.trap.omega_x * self.trap.omega_y * self.trap.omega_z)  # Prevent division by zero
+        T = max(1e-10, self.T)  # Prevent division by zero
+        vol = (2 * np.pi * k * T / (Rb87.mass * omega))**1.5
+        return min(self.N / vol, 1e19)  # Cap at realistic maximum density
         
 
 class TiltedDipleTrap(DipleTrap):
@@ -456,7 +481,7 @@ def run_full_sequence(P_y, P_z, P_R, P_p, B_z):
     # MOT loading and compression (99 ms)
     atoms = mot_loading_and_compression(atoms, trap, P_y, P_z, B_z)
     results.append(calculate_observables(atoms))
-    #print(f"After MOT: N = {atoms.N:.2e}, T = {atoms.T*1e6:.2f} μK")
+    print(f"After MOT: N = {atoms.N:.2e}, T = {atoms.T*1e6:.2f} μK")
     
     # Five stages of Raman cooling (63 ms each)
     for i in range(5):
@@ -477,7 +502,7 @@ def run_full_sequence(P_y, P_z, P_R, P_p, B_z):
         
         results.append(calculate_observables(atoms))
         trap_frequencies.append((atoms.trap.omega_x, atoms.trap.omega_y, atoms.trap.omega_z))
-        #print(f"After Raman cooling {i}: N = {atoms.N:.2e}, T = {atoms.T*1e6:.2f} μK")
+        print(f"After Raman cooling {i}: N = {atoms.N:.2e}, T = {atoms.T*1e6:.2f} μK")
           
     # Six stages of evaporation (27 ms each)
     for i in range(5, 11):
@@ -491,7 +516,7 @@ def run_full_sequence(P_y, P_z, P_R, P_p, B_z):
         
         results.append(calculate_observables(atoms))
         trap_frequencies.append((atoms.trap.omega_x, atoms.trap.omega_y, atoms.trap.omega_z))
-        #print(f"After evaporation stage {i-4}: N = {atoms.N:.2e}, T = {atoms.T*1e6:.2f} μK")
+        print(f"After evaporation stage {i-4}: N = {atoms.N:.2e}, T = {atoms.T*1e6:.2f} μK")
     
     for i in range(len(results) - 1):
         cooling_efficiencies.append(calculate_cooling_efficiency(results[i:i+2]))
