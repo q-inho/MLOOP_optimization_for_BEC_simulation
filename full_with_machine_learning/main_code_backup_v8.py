@@ -571,7 +571,8 @@ def optical_pumping(atoms, P_p, delta, sigma_minus_beam):
 
 def mot_loading_and_compression(atoms, trap, P_y, P_z, B_z):
     logging.debug(f"Starting MOT loading and compression: N = {atoms.N}, "
-                  f"mean T = {np.mean(atoms.T)*1e6:.2f} μK")
+                  f"positions shape = {atoms.positions.shape}, "
+                  f"velocities shape = {atoms.velocities.shape}")
     
     try:
         # 88 ms of MOT loading and initial compression
@@ -582,16 +583,14 @@ def mot_loading_and_compression(atoms, trap, P_y, P_z, B_z):
         
         logging.debug(f"After initial compression: N = {atoms.N}, "
                       f"positions shape = {atoms.positions.shape}, "
-                      f"velocities shape = {atoms.velocities.shape}, "
-                      f"mean T = {np.mean(atoms.T)*1e6:.2f} μK")
+                      f"velocities shape = {atoms.velocities.shape}")
         
         # Apply gray molasses for 1 ms
         atoms.apply_gray_molasses(0.001)
         
         logging.debug(f"After gray molasses: N = {atoms.N}, "
                       f"positions shape = {atoms.positions.shape}, "
-                      f"velocities shape = {atoms.velocities.shape}, "
-                      f"mean T = {np.mean(atoms.T)*1e6:.2f} μK")
+                      f"velocities shape = {atoms.velocities.shape}")
         
         # 10 ms ramp of trap beam powers with some heating
         initial_P_y, initial_P_z = trap.P_y, trap.P_z
@@ -605,10 +604,7 @@ def mot_loading_and_compression(atoms, trap, P_y, P_z, B_z):
         
         logging.debug(f"After power ramp: N = {atoms.N}, "
                       f"positions shape = {atoms.positions.shape}, "
-                      f"velocities shape = {atoms.velocities.shape}, "
-                      f"mean T = {np.mean(atoms.T)*1e6:.2f} μK, "
-                      f"P_y = {trap.P_y:.2e} W, P_z = {trap.P_z:.2e} W")
-        
+                      f"velocities shape = {atoms.velocities.shape}")
         
         # 1 ms magnetic field adjustment
         initial_B_z = B_z[0]
@@ -620,9 +616,7 @@ def mot_loading_and_compression(atoms, trap, P_y, P_z, B_z):
         
         logging.debug(f"After magnetic field adjustment: N = {atoms.N}, "
                       f"positions shape = {atoms.positions.shape}, "
-                      f"velocities shape = {atoms.velocities.shape}",
-                      f"mean T = {np.mean(atoms.T)*1e6:.2f} μK, B_z = {current_B_z:.2e} T")
-        
+                      f"velocities shape = {atoms.velocities.shape}")
         
         # Adjust atom number to match reference
         atoms.N = int(2.7e5)
@@ -630,10 +624,7 @@ def mot_loading_and_compression(atoms, trap, P_y, P_z, B_z):
         
         logging.debug(f"After atom number adjustment: N = {atoms.N}, "
                       f"positions shape = {atoms.positions.shape}, "
-                      f"velocities shape = {atoms.velocities.shape}, "
-                      f"mean T = {np.mean(atoms.T)*1e6:.2f} μK, "
-                      f"P_y = {trap.P_y:.2e} W, P_z = {trap.P_z:.2e} W, B_z = {current_B_z:.2e} T")
-        
+                      f"velocities shape = {atoms.velocities.shape}")
         
     except Exception as e:
         logging.error(f"Error in mot_loading_and_compression: {e}")
