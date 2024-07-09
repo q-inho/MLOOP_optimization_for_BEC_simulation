@@ -524,50 +524,88 @@ def raman_cooling(atoms, P_R, P_p, delta_R, sigma_minus_beam, pi_beam, trap):
         raise
 
 def optical_pumping(atoms, P_p, delta, sigma_minus_beam):
-    I = sigma_minus_beam.intensity(atoms.positions)
-    I_sat = 1.67  # Saturation intensity for Rb87 D1 line
-    s = I / I_sat
-    gamma_sc = Rb87.gamma_D1 / 2 * s / (1 + s + 4 * delta**2 / Rb87.gamma_D1**2)
-    
-    reabsorption_prob = atoms.calculate_density() * 3 * Rb87.wavelength_D1**2 / (2 * np.pi)
-    
-    # Add a small epsilon to avoid division by zero
-    epsilon = 1e-10
-    festina_lente_factor = 1 / (1 + reabsorption_prob * gamma_sc / (atoms.trap.omega_x + epsilon))
+    # Constants
+    I_sat = 1.67  # Saturation intensity for Rb87 D1 line in mW/cm^2
+    delta_optimal = -4.33e9  # -4.33 GHz detuning from D1 F=2 to F'=2' transition
+    branching_ratio = 1/3  # Probability to end up in the dark state
 
+    # Ensure consistency in array sizes
+    atoms.force_sync()
+    N = atoms.N
+
+    # Calculate spatially-dependent intensity
+    I = sigma_minus_beam.intensity(atoms.positions)
+    s = I / I_sat
+
+    # Calculate scattering rate
+    gamma_sc = Rb87.gamma_D1 / 2 * s / (1 + s + 4 * (delta - delta_optimal)**2 / Rb87.gamma_D1**2)
+
+    # Calculate light shift
+    light_shift = hbar * Rb87.gamma_D1**2 * I / (8 * delta * I_sat)
+    atoms.light_shift = light_shift
+
+    # Calculate reabsorption probability
+    n = atoms.calculate_density()
+    reabsorption_prob = n * 3 * Rb87.wavelength_D1**2 / (2 * np.pi)
+
+    # Calculate festina lente factor using geometric mean of trap frequencies
+    omega_mean = np.cbrt(atoms.trap.omega_x * atoms.trap.omega_y * atoms.trap.omega_z)
+    epsilon = 1e-10  # Small value to avoid division by zero
+    festina_lente_factor = 1 / (1 + reabsorption_prob * gamma_sc / (omega_mean + epsilon))
+
+    # Calculate scattering probability
     scattering_prob = gamma_sc * dt * festina_lente_factor
-    scattering_mask = np.random.random(atoms.N) < scattering_prob
-    
-    if np.sum(scattering_mask) > 0:
+    scattering_mask = np.random.random(N) < scattering_prob
+
+    scattered_atoms = np.sum(scattering_mask)
+    if scattered_atoms > 0:
+        # Calculate recoil effects
         recoil_velocity = Rb87.vr_D1
-        recoil_directions = np.random.randn(np.sum(scattering_mask), 3)
+        recoil_directions = np.random.randn(scattered_atoms, 3)
         recoil_directions /= np.linalg.norm(recoil_directions, axis=1)[:, np.newaxis]
-        
+
+        # Calculate energy before scattering
         E_before = 0.5 * Rb87.mass * np.sum(atoms.velocities[scattering_mask]**2)
-        
-        # Account for branching ratio
-        branching_ratio = 1/3  # Assuming 1/3 chance to end up in the dark state
-        pumping_mask = np.random.random(np.sum(scattering_mask)) < branching_ratio
+
+        # Apply recoil to scattered atoms
+        pumping_mask = np.random.random(scattered_atoms) < branching_ratio
         atoms.velocities[scattering_mask][pumping_mask] += recoil_velocity * recoil_directions[pumping_mask]
-        
+
+        # Calculate energy after scattering
         E_after = 0.5 * Rb87.mass * np.sum(atoms.velocities[scattering_mask]**2)
-        
         delta_E = E_after - E_before
-        atoms.T[scattering_mask] += delta_E / (3 * np.sum(scattering_mask) * k)
-        
-        # Bosonic stimulation effect
-        v_magnitude = np.linalg.norm(atoms.velocities, axis=1)
-        ground_state_mask = v_magnitude < Rb87.vr_D1
-        stimulation_factor = 1 + atoms.calculate_density() * Rb87.wavelength_D1**3
-        atoms.velocities[ground_state_mask] *= np.exp(-stimulation_factor * dt)
-        
+
+        # Update temperature for scattered atoms
+        atoms.T[scattering_mask] += delta_E / (3 * scattered_atoms * k)
+
+        # Light-assisted collisions (suppressed due to far-detuned light)
+        collision_rate = calculate_light_assisted_collision_rate(n, I, delta)
+        collision_prob = collision_rate * dt
+        collision_mask = np.random.random(N) < collision_prob
+        atoms.update_atom_number(N - np.sum(collision_mask))
+
+        # Pumping out of F=1 manifold
+        F1_pump_prob = 0.1 * scattering_prob  # Assuming 10% probability of pumping out of F=1
+        F1_pump_mask = np.random.random(N) < F1_pump_prob
+        atoms.update_atom_number(atoms.N + np.sum(F1_pump_mask))
+
         atoms.update_temperature()
-        
+        atoms.force_sync()
+
         logging.debug(f"Optical pumping: mean delta_T = {np.mean(delta_E / (3 * k)):.2e}, "
                       f"mean T = {np.mean(atoms.T):.2e}, "
-                      f"scattered atoms: {np.sum(scattering_mask)}")
+                      f"scattered atoms: {scattered_atoms}, "
+                      f"light-assisted collisions: {np.sum(collision_mask)}, "
+                      f"F=1 pumping: {np.sum(F1_pump_mask)}")
     else:
         logging.debug("No atoms affected by optical pumping in this step.")
+
+def calculate_light_assisted_collision_rate(n, I, delta):
+    # This is a simplified model and may need to be adjusted based on experimental data
+    C = 1e-12  # Coefficient to be adjusted based on experimental observations
+    return C * n**2 * I / delta**2
+
+
 
 def mot_loading_and_compression(atoms, trap, P_y, P_z, B_z):
     logging.debug(f"Starting MOT loading and compression: N = {atoms.N}, "
