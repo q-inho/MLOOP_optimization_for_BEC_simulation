@@ -916,11 +916,11 @@ def run_full_sequence(params):
         logging.info(f"After MOT: N = {atoms.N:.2e}, mean T = {np.mean(atoms.T)*1e6:.2f} μK")
 
         # Define cooling stage boundaries
-        stage_times = [0.099, 0.163, 0.225, 0.288, 0.351, 0.414, 0.575]
+        stage_times = [0.099, 0.2, 0.3, 0.34, 0.38, 0.414, 0.575]
         stage_names = ['S1', 'S2', 'X1', 'X2', 'X3', 'Evaporation']
 
         # Define ODT transition parameters
-        odt_transition_start = 0.225  # Start of X1 stage
+        odt_transition_start = 0.3  # Start of X1 stage
         odt_transition_duration = 0.01  # 10 ms transition
         P_z_final = P_z_interp(odt_transition_start + odt_transition_duration)
 
@@ -931,12 +931,10 @@ def run_full_sequence(params):
         for i, t in enumerate(time_array[int(0.099/dt):], start=int(0.099/dt)):
             try:
                 atoms.force_sync()
-                logging.info(f"After MOT2: N = {atoms.N:.2e}, mean T = {np.mean(atoms.T)*1e6:.2f} μK")
-
                 # Update trap parameters
                 P_y_target = P_y_interp(t)
                 trap.P_y = P_y_target
-                
+
                 # Transition to crossed ODT
                 if odt_transition_start <= t < (odt_transition_start + odt_transition_duration):
                     transition_progress = (t - odt_transition_start) / odt_transition_duration
@@ -968,10 +966,8 @@ def run_full_sequence(params):
 
                     sigma_minus_beam.power = P_p
                     pi_beam.power = P_R
-                    
 
                     delta_R = raman_cooling(atoms, P_R, P_p, delta_R, sigma_minus_beam, pi_beam, trap)
-                    logging.info(f"After MOT3: N = {atoms.N:.2e}, mean T = {np.mean(atoms.T)*1e6:.2f} μK")
                     optical_pumping(atoms, P_p, -4.33e9, sigma_minus_beam, B_z_interp(t), trap)
                     atoms.apply_light_assisted_collisions(P_p, -4.33e9)
                     

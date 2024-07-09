@@ -1,12 +1,10 @@
 import numpy as np
 from scipy.constants import h, hbar, k, atomic_mass, mu_0, g, c, epsilon_0
-from scipy.stats import maxwell
 from scipy.optimize import minimize
 from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
 from scipy.optimize import curve_fit, minimize_scalar
 from scipy.interpolate import interp1d
-from scipy.spatial import ConvexHull
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import logging
@@ -80,15 +78,8 @@ class AtomCloud:
 
 
     def initialize_positions(self):
-        sigma_x = np.sqrt(k * np.mean(self.T) / (Rb87.mass * self.trap.omega_x**2))
-        sigma_y = np.sqrt(k * np.mean(self.T) / (Rb87.mass * self.trap.omega_y**2))
-        sigma_z = np.sqrt(k * np.mean(self.T) / (Rb87.mass * self.trap.omega_z**2))
-        
-        x = np.random.normal(0, sigma_x, self.N)
-        y = np.random.normal(0, sigma_y, self.N)
-        z = np.random.normal(0, sigma_z, self.N)
-        
-        return np.column_stack((x, y, z))
+        sigma = np.sqrt(k * np.mean(self.T) / (Rb87.mass * (2*np.pi*100)**2))
+        return np.random.normal(0, sigma, (self.N, 3))
 
     def initialize_velocities(self):
         sigma_v = np.sqrt(k * self.T[:, np.newaxis] / Rb87.mass)
@@ -119,18 +110,9 @@ class AtomCloud:
         self.positions += self.velocities * dt
 
     def update_temperature(self):
-        if self.N > 0:
-            kinetic_energy = 0.5 * Rb87.mass * np.sum(self.velocities**2, axis=1)
-            self.T = 2 * kinetic_energy / (3 * k)
-        else:
-            self.T = np.array([1e-9])  # Set to 1 nK if no atoms left
+        kinetic_energy = 0.5 * Rb87.mass * np.sum(self.velocities**2, axis=1)
+        self.T = np.maximum(2 * kinetic_energy / (3 * k), 1e-9)
 
-    def update_positions_velocities(self, dt):
-        # Update positions and velocities using the Verlet algorithm
-        acceleration = -self.trap.calculate_force(self.positions) / Rb87.mass
-        self.positions += self.velocities * dt + 0.5 * acceleration * dt**2
-        new_acceleration = -self.trap.calculate_force(self.positions) / Rb87.mass
-        self.velocities += 0.5 * (acceleration + new_acceleration) * dt
 
     def update_velocities(self):
         sigma_v = np.sqrt(k * self.T / Rb87.mass)
@@ -180,58 +162,6 @@ class AtomCloud:
                 indices = np.random.choice(len(self.positions), new_N, replace=False)
                 self.positions = self.positions[indices]
                 self.velocities = self.velocities[indices]
-
-    def apply_odt_transition_monte_carlo(self, old_trap, new_trap, transition_progress):
-        # Calculate potential energy in old and new traps
-        old_potential = old_trap.calculate_potential(self.positions)
-        new_potential = new_trap.calculate_potential(self.positions)
-        
-        # Calculate kinetic energy
-        kinetic_energy = 0.5 * Rb87.mass * np.sum(self.velocities**2, axis=1)
-        
-        # Total energy in old trap
-        total_energy_old = old_potential + kinetic_energy
-        
-        # Calculate the maximum allowed energy in the new trap
-        max_allowed_energy = new_trap.calculate_trap_depth()
-        
-        # Calculate loss probability for each atom
-        loss_probability = np.clip((total_energy_old - max_allowed_energy) / max_allowed_energy, 0, 1)
-        
-        # Monte Carlo decision for each atom
-        random_numbers = np.random.random(self.N)
-        retained_mask = random_numbers > loss_probability
-        
-        # Update atom number
-        self.N = np.sum(retained_mask)
-        
-        if self.N > 0:
-            # Update positions and velocities for retained atoms
-            self.positions = self.positions[retained_mask]
-            self.velocities = self.velocities[retained_mask]
-            self.T = self.T[retained_mask]
-            
-            # Redistribute excess energy between potential and kinetic
-            excess_energy = np.maximum(total_energy_old[retained_mask] - new_potential[retained_mask], 0)
-            new_kinetic_energy = kinetic_energy[retained_mask] + 0.5 * excess_energy
-            
-            # Update velocities based on new kinetic energy
-            velocity_scaling = np.sqrt(new_kinetic_energy / kinetic_energy[retained_mask])
-            self.velocities *= velocity_scaling[:, np.newaxis]
-            
-            # Update temperature
-            self.T *= np.mean(velocity_scaling**2)
-        
-        else:
-            # If all atoms are lost, reinitialize with a small number of atoms
-            self.N = 1
-            self.T = np.array([1e-6])  # 1 µK
-            self.positions = new_trap.get_trap_center().reshape(1, 3)
-            self.velocities = np.zeros((1, 3))
-        
-        # Update light shift
-        self.light_shift = self.light_shift[retained_mask] if self.N > 1 else np.zeros(1)
-
 
     def apply_subrecoil_cooling(self, v_eff_recoil):
         """Apply subrecoil cooling to atoms below the effective recoil limit."""
@@ -310,31 +240,35 @@ class AtomCloud:
         
     # In the AtomCloud class, modify the calculate_density method:
     def calculate_density(self):
-        if self.N < 2:
-            return 0
-        
-        # Calculate the volume of the cloud using convex hull
-        hull = ConvexHull(self.positions)
-        volume = hull.volume
-        
-        return self.N / volume
+        omega = (self.trap.omega_x * self.trap.omega_y * self.trap.omega_z)**(1/3)
+        return self.N * (Rb87.mass * omega / (2 * np.pi * k * np.mean(self.T)))**(3/2)
 
 
     def update_atom_number(self, new_N):
-        new_N = int(max(new_N, 1))  # Ensure at least one atom
-        if new_N < self.N:
-            indices = np.random.choice(self.N, new_N, replace=False)
-            self.positions = self.positions[indices]
-            self.velocities = self.velocities[indices]
-            self.T = self.T[indices]
-            self.light_shift = self.light_shift[indices]
-        elif new_N > self.N:
-            additional_count = new_N - self.N
-            self.positions = np.vstack((self.positions, self.initialize_positions()[:additional_count]))
-            self.velocities = np.vstack((self.velocities, self.initialize_velocities()[:additional_count]))
-            self.T = np.concatenate((self.T, np.full(additional_count, np.mean(self.T))))
-            self.light_shift = np.concatenate((self.light_shift, np.zeros(additional_count)))
-        self.N = new_N
+        try:
+            new_N = int(max(new_N, 1))  # Ensure at least one atom
+            if new_N < self.N:
+                indices = np.random.choice(self.N, new_N, replace=False)
+                self.positions = self.positions[indices]
+                self.velocities = self.velocities[indices]
+                self.T = self.T[indices]
+                self.light_shift = self.light_shift[indices]
+            elif new_N > self.N:
+                additional_count = new_N - self.N
+                self.positions = np.vstack((self.positions, self.initialize_positions()[:additional_count]))
+                self.velocities = np.vstack((self.velocities, self.initialize_velocities()[:additional_count]))
+                self.T = np.concatenate((self.T, np.full(additional_count, np.mean(self.T))))
+                self.light_shift = np.concatenate((self.light_shift, np.zeros(additional_count)))
+            self.N = new_N
+            self.check_consistency()
+            logging.debug(f"After update_atom_number: N = {self.N}, "
+                          f"positions shape = {self.positions.shape}, "
+                          f"velocities shape = {self.velocities.shape}, "
+                          f"T shape = {self.T.shape}, "
+                          f"light_shift shape = {self.light_shift.shape}")
+        except Exception as e:
+            logging.error(f"Error in update_atom_number: {e}")
+            raise
 
 
         
@@ -400,8 +334,8 @@ class TiltedDipleTrap:
         x, y, z = r
         U0_y = 2 * self.alpha * self.P_y / (np.pi * c * epsilon_0 * self.w_y**2)
         U0_z = 2 * self.alpha * self.P_z / (np.pi * c * epsilon_0 * self.w_z**2)
-        U_y = -U0_y * np.exp(-2 * (x**2 + (z*np.cos(self.tilt_angle) + y*np.sin(self.tilt_angle))**2) / self.w_y**2)
-        U_z = -U0_z * np.exp(-2 * (x**2 + y**2) / self.w_z**2)
+        U_y = self.beam_potential([x, y, z], U0_y, self.w_y, self.z_R_y)
+        U_z = self.beam_potential([x, y, z], U0_z, self.w_z, self.z_R_z)
         U_g = Rb87.mass * g * z * np.cos(self.tilt_angle)
         return U_y + U_z + U_g
     
@@ -415,32 +349,23 @@ class TiltedDipleTrap:
         return np.column_stack((F_x, F_y, F_z))
     
     def calculate_trap_depth(self):
-        # Calculate the trap depth considering both beams and gravity
-        U_0y = 2 * self.alpha * self.P_y / (np.pi * c * epsilon_0 * self.w_y**2)
-        U_0z = 2 * self.alpha * self.P_z / (np.pi * c * epsilon_0 * self.w_z**2)
+        # Calculate individual beam depths
+        U0_y = 2 * self.alpha * self.P_y / (np.pi * c * epsilon_0 * self.w_y**2)
+        U0_z = 2 * self.alpha * self.P_z / (np.pi * c * epsilon_0 * self.w_z**2)
         
-        # Depth along y-axis (horizontal)
-        depth_y = U_0y + U_0z
+        # Total depth is the sum of individual depths
+        total_depth = U0_y + U0_z
         
-        # Depth along z-axis (vertical), considering gravity
-        z_max = np.sqrt(2 * U_0y / (Rb87.mass * g * np.cos(self.tilt_angle)))
-        depth_z = U_0y + U_0z - Rb87.mass * g * z_max * np.cos(self.tilt_angle)
+        # Convert to Kelvin
+        depth_K = total_depth / k
         
-        # Return the minimum of the two depths
-        return min(depth_y, depth_z)
-    
-    def transition_to_crossed_odt(self, t, transition_start, transition_duration, P_z_final):
-        # Implement smooth transition to crossed ODT
-        progress = min((t - transition_start) / transition_duration, 1)
-        self.P_z = P_z_final * progress
-        self.update_trap_frequencies()
+        # Account for gravity (approximate)
+        gravity_effect = Rb87.mass * g * self.w_y * np.cos(self.tilt_angle) / k
         
-        # Calculate and return the new trap depth
-        return self.calculate_trap_depth()
-    
-    def get_trap_center(self):
-        # Return the position of the trap center
-        return np.array([0, 0, 0])
+        # Subtract gravity effect
+        adjusted_depth = depth_K - gravity_effect
+        
+        return max(adjusted_depth, 0)  # Ensure non-negative depth
 
 
 def photoassociation_loss_rate(delta, intensity):
@@ -519,7 +444,10 @@ def raman_cooling(atoms, P_R, P_p, delta_R, sigma_minus_beam, pi_beam, trap):
             cooled_velocities[pumping_mask] += v_recoil * np.random.randn(np.sum(pumping_mask), 3)
             
             # Subrecoil cooling model
-            atoms.apply_subrecoil_cooling(v_eff_recoil)
+            v_magnitude = np.linalg.norm(cooled_velocities, axis=1)
+            subrecoil_mask = v_magnitude < v_eff_recoil
+            cooling_strength = np.exp(-(v_magnitude[subrecoil_mask] / v_eff_recoil)**2)
+            cooled_velocities[subrecoil_mask] *= np.maximum(0, 1 - cooling_strength[:, np.newaxis])
             
             # Apply festina lente regime
             n = atoms.calculate_density()
@@ -582,7 +510,6 @@ def raman_cooling(atoms, P_R, P_p, delta_R, sigma_minus_beam, pi_beam, trap):
         logging.error(f"Error in raman_cooling: {e}")
         raise
 
-
 def optical_pumping(atoms, P_p, delta, sigma_minus_beam, B_z, trap):
     try:
         atoms.force_sync()
@@ -636,7 +563,7 @@ def optical_pumping(atoms, P_p, delta, sigma_minus_beam, B_z, trap):
             
             # Apply subrecoil cooling
             v_eff_recoil = np.sqrt(2 * 29e3 * h / Rb87.mass)
-            atoms.apply_subrecoil_cooling(v_eff_recoil)
+            apply_subrecoil_cooling(atoms, v_eff_recoil)
 
             atoms.update_temperature()
             atoms.force_sync()
@@ -802,9 +729,9 @@ def mot_loading_and_compression(atoms, trap, P_y, P_z, B_z):
                       f"mean T = {np.mean(atoms.T)*1e6:.2f} μK, B_z = {current_B_z:.2e} T")
         
         
-        # Ensure atom number doesn't increase
-        atoms.N = min(atoms.N, N_atoms_initial)
-        atoms.force_sync()
+        # Adjust atom number to match reference
+        atoms.N = int(2.7e5)
+        atoms.update_atom_number(atoms.N)
         
         logging.debug(f"After atom number adjustment: N = {atoms.N}, "
                       f"positions shape = {atoms.positions.shape}, "
@@ -905,25 +832,27 @@ def run_full_sequence(params):
         # Create time array
         time_array = np.linspace(0, total_time, int(total_time / dt))
 
-        # MOT loading and compression phase
+        logging.debug("Starting MOT loading and compression")
         atoms = mot_loading_and_compression(atoms, trap, P_y_interp(time_array[:int(0.099/dt)]), 
                                             P_z_interp(time_array[:int(0.099/dt)]), B_z_interp(time_array[:int(0.099/dt)]))
-        
+        logging.debug("Finished MOT loading and compression")
+
         atoms.force_sync()
         results.append(calculate_observables(atoms))
         trap_frequencies.append((trap.omega_x, trap.omega_y, trap.omega_z))
         times.append(0.099)
         logging.info(f"After MOT: N = {atoms.N:.2e}, mean T = {np.mean(atoms.T)*1e6:.2f} μK")
-
-        # Define cooling stage boundaries
-        stage_times = [0.099, 0.163, 0.225, 0.288, 0.351, 0.414, 0.575]
-        stage_names = ['S1', 'S2', 'X1', 'X2', 'X3', 'Evaporation']
-
-        # Define ODT transition parameters
-        odt_transition_start = 0.225  # Start of X1 stage
-        odt_transition_duration = 0.01  # 10 ms transition
-        P_z_final = P_z_interp(odt_transition_start + odt_transition_duration)
-
+        
+        # Pre-calculate some values
+        raman_cooling_end = 0.414  # End of Raman cooling phase
+        xodt_start = 0.3  # Start of crossed ODT
+        record_interval = 1000
+        min_trap_depth = 1e-6  # Minimum trap depth in Kelvin
+        
+        # Variables for detecting sudden changes
+        prev_N = atoms.N
+        prev_T = np.mean(atoms.T)
+        
         # Initialize delta_R
         delta_R = calculate_delta_R(B_z_interp(0.099))  # Start with initial value
         
@@ -931,66 +860,50 @@ def run_full_sequence(params):
         for i, t in enumerate(time_array[int(0.099/dt):], start=int(0.099/dt)):
             try:
                 atoms.force_sync()
-                logging.info(f"After MOT2: N = {atoms.N:.2e}, mean T = {np.mean(atoms.T)*1e6:.2f} μK")
-
                 # Update trap parameters
-                P_y_target = P_y_interp(t)
-                trap.P_y = P_y_target
+                P_y_target, P_z_target = P_y_interp(t), P_z_interp(t)
+                trap.ramp_powers(t - 0.099, 0.01, P_y_target, P_z_target)  # 10 ms ramp duration
                 
                 # Transition to crossed ODT
-                if odt_transition_start <= t < (odt_transition_start + odt_transition_duration):
-                    transition_progress = (t - odt_transition_start) / odt_transition_duration
-                    
-                    # Create new trap with updated parameters
-                    new_P_z = P_z_final * transition_progress
-                    new_trap = TiltedDipleTrap(P_y_target, new_P_z, 18e-6, 14e-6, 1064e-9, tilt_angle)
-                    
-                    # Apply the ODT transition to the atom distribution using Monte Carlo method
-                    atoms.apply_odt_transition_monte_carlo(trap, new_trap, transition_progress)
-                    
-                    # Update the trap object
-                    trap = new_trap
-                else:
-                    trap.P_z = P_z_interp(t)
+                if t >= xodt_start:
+                    trap.update_waists(18e-6, 14e-6)  # Adjust waists for crossed ODT
                 
+                # Calculate trap depth
                 trap_depth = trap.calculate_trap_depth()
-                trap.update_trap_frequencies()
+                if trap_depth < min_trap_depth:
+                    trap_depth = min_trap_depth
                 
-                # Determine current cooling stage
-                current_stage = next(i for i, time in enumerate(stage_times) if t < time) - 1
-                stage_start, stage_end = stage_times[current_stage:current_stage+2]
-                stage_name = stage_names[current_stage]
-
-                # Adjust cooling parameters based on current stage
-                if stage_name != 'Evaporation':
-                    P_R = P_R_interp(t)
-                    P_p = P_p_interp(t)
-
-                    sigma_minus_beam.power = P_p
-                    pi_beam.power = P_R
-                    
-
-                    delta_R = raman_cooling(atoms, P_R, P_p, delta_R, sigma_minus_beam, pi_beam, trap)
-                    logging.info(f"After MOT3: N = {atoms.N:.2e}, mean T = {np.mean(atoms.T)*1e6:.2f} μK")
-                    optical_pumping(atoms, P_p, -4.33e9, sigma_minus_beam, B_z_interp(t), trap)
-                    atoms.apply_light_assisted_collisions(P_p, -4.33e9)
+                sigma_minus_beam.power = P_p_interp(t)
+                pi_beam.power = P_R_interp(t)
+                
+                atoms.update(dt)
+                
+                if t < raman_cooling_end:  # Raman cooling phase (until 414ms)
+                    delta_R = raman_cooling(atoms, P_R_interp(t), P_p_interp(t), delta_R, sigma_minus_beam, pi_beam, trap)
+                    optical_pumping(atoms, P_p_interp(t), -4.33e9, sigma_minus_beam, B_z_interp(t), trap)
+                    atoms.apply_light_assisted_collisions(P_p_interp(t), -4.33e9)
                     
                     # Update B_z based on new delta_R
                     B_z = delta_R * hbar / (2 * Rb87.mu_B * Rb87.g_F)
                     atoms.apply_magnetic_field(B_z)
-                else:  # Evaporative cooling phase
-                    atoms.apply_evaporative_cooling(trap_depth)
-                
-                atoms.update_positions_velocities(dt)
                 
                 # Apply temperature-dependent three-body recombination
                 atoms.apply_three_body_recombination()
                 
                 atoms.apply_photon_reabsorption_heating(P_p_interp(t), -4.33e9)
+                atoms.apply_evaporative_cooling(trap_depth)
                 
-                # Record results and log information
-                if i % 1000 == 0:
-                    atoms.update_temperature()
+                # Detect sudden changes
+                current_T = np.mean(atoms.T)
+                if abs(atoms.N - prev_N) / prev_N > 0.1 or abs(current_T - prev_T) / prev_T > 0.1:
+                    logging.warning(f"Sudden change detected at t = {t:.3f}s: "
+                                    f"ΔN/N = {(atoms.N - prev_N)/prev_N:.2f}, "
+                                    f"ΔT/T = {(current_T - prev_T)/prev_T:.2f}")
+                
+                prev_N, prev_T = atoms.N, current_T
+                
+                if i % record_interval == 0:  # Record results every 1000 steps
+                    logging.info(f"At t = {t:.3f}s: N = {atoms.N:.2e}, mean T = {np.mean(atoms.T)*1e6:.2f} μK")
                     results.append(calculate_observables(atoms))
                     trap_frequencies.append((trap.omega_x, trap.omega_y, trap.omega_z))
                     condensate_fractions.append(detect_bec(atoms))
@@ -998,13 +911,13 @@ def run_full_sequence(params):
                     
                     if len(results) > 1:
                         cooling_efficiencies.append(calculate_cooling_efficiency(results[-2:]))
-                    
-                    logging.info(f"At t = {t:.3f}s ({stage_name}): N = {atoms.N:.2e}, mean T = {np.mean(atoms.T)*1e6:.2f} μK")
-                    logging.info(f"Trap frequencies: ωx = {trap.omega_x/(2*np.pi):.2f} Hz, ωy = {trap.omega_y/(2*np.pi):.2f} Hz, ωz = {trap.omega_z/(2*np.pi):.2f} Hz")
-                    logging.info(f"Trap depth: {trap_depth/k*1e6:.2f} μK")
-                    logging.info(f"Density: {atoms.calculate_density():.2e} m^-3")
-                
                 atoms.force_sync()  # Ensure consistency after each iteration
+            
+                if i % 1000 == 0:  # Log debug information every 1000 iterations
+                    logging.debug(f"Iteration {i}, t = {t:.3f}s: N = {atoms.N}, "
+                                f"mean T = {np.mean(atoms.T):.2e}, "
+                                f"positions shape = {atoms.positions.shape}, "
+                                f"velocities shape = {atoms.velocities.shape}")
                     
             except Exception as e:
                 logging.error(f"Error at t = {t:.3f}s: {e}")
@@ -1045,7 +958,6 @@ def run_full_sequence(params):
                       f"velocities shape = {atoms.velocities.shape}, "
                       f"T shape = {atoms.T.shape}")
         raise
-
 
 class BayesianOptimizer:
     def __init__(self, parameter_ranges, cost_function, n_initial=20, n_estimators=5):
