@@ -9,8 +9,6 @@ from scipy.interpolate import interp1d
 from scipy.spatial import ConvexHull
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
-from matplotlib.animation import FuncAnimation, writers
 import logging
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -59,13 +57,7 @@ class Rb87:
     def calculate_K3(cls, T):
         K3_0 = 4.3e-29  # cm^6/s for Rb-87 in |2, -2⟩ state
         T_scale = 100e-6  # 100 μK
-        
-        # Avoid potential overflow by breaking down the calculation
-        ratio = T / T_scale
-        term = 1 + ratio**2
-        
-        # Use numpy.clip to ensure the result doesn't exceed the maximum float value
-        return np.clip(K3_0 * term * 1e-12, 0, np.finfo(float).max)
+        return K3_0 * (1 + (T / T_scale)**2) * 1e-12  # Convert to m^6/s
 
 class BeamParameters:
     odt_horizontal_waist = 18e-6  # 18 μm
@@ -75,7 +67,7 @@ class BeamParameters:
     op_waist_y = 1e-3             # 1 mm
     
 # Simulation parameters
-N_atoms_initial = int(4e5)
+N_atoms_initial = int(1)
 T_initial = 300e-6
 dt = 1e-5
 
@@ -90,43 +82,13 @@ class LaserBeam:
     def intensity(self, positions):
         x, y, _ = positions.T
         return 2 * self.power / (np.pi * self.w_x * self.w_y) * np.exp(-2 * (x**2 / self.w_x**2 + y**2 / self.w_y**2))
-
-
-class VacuumChamber:
-    def __init__(self, radius=0.05):
-        self.radius = radius
-        self.max_allowed_distance = 1e6 * self.radius  # Set a maximum allowed distance
-
-
-    def is_inside(self, positions):
-        # Check if positions are inside the spherical chamber
-        return np.sum(positions**2, axis=1) < self.radius**2
-
-    def enforce_boundary(self, positions, velocities):
-        distances = np.sqrt(np.sum(positions**2, axis=1))
-        outside_mask = distances > self.radius
-        far_outside_mask = distances > self.max_allowed_distance
-        
-        if np.any(far_outside_mask):
-            #logging.warning(f"Atoms detected at extreme distances. Resetting {np.sum(far_outside_mask)} atoms.")
-            positions[far_outside_mask] = np.random.uniform(-self.radius, self.radius, (np.sum(far_outside_mask), 3))
-            velocities[far_outside_mask] = np.zeros((np.sum(far_outside_mask), 3))
-        
-        if np.any(outside_mask):
-            normals = -positions[outside_mask] / distances[outside_mask, np.newaxis]
-            positions[outside_mask] = normals * self.radius + (positions[outside_mask] - normals * distances[outside_mask, np.newaxis])
-            v_parallel = np.sum(velocities[outside_mask] * normals, axis=1)[:, np.newaxis] * normals
-            velocities[outside_mask] = velocities[outside_mask] - 2 * v_parallel
-
-        return positions, velocities
-
+    
 
 class AtomCloud:
-    def __init__(self, N, T, trap, vacuum_chamber):
-        self.N = int(max(round(N), 1))
+    def __init__(self, N, T, trap):
+        self.N = int(max(round(N), 1))  # Ensure integer atom number and at least one atom
         self.trap = trap
-        self.vacuum_chamber = vacuum_chamber
-        self.T = np.full(self.N, max(T, 1e-9))  # Initialize temperature array
+        self.T = np.full(self.N, max(T, 1e-9))  # Ensure non-zero temperature (1 nK minimum)
         self.positions = self.initialize_positions()
         self.velocities = self.initialize_velocities()
         self.light_shift = np.zeros(self.N)
@@ -135,20 +97,18 @@ class AtomCloud:
         self.max_atom_change_ratio = 0.1  # Maximum allowed fractional change in atom number per time step
         self.check_consistency()
 
-    def get_atom_data(self):
-        return self.positions, self.T
-
 
 
     def initialize_positions(self):
-        # Initialize positions uniformly within the spherical chamber
-        r = self.vacuum_chamber.radius * np.cbrt(np.random.random(self.N))
-        theta = np.arccos(2 * np.random.random(self.N) - 1)
-        phi = 2 * np.pi * np.random.random(self.N)
+        epsilon = 1e-10
         
-        x = r * np.sin(theta) * np.cos(phi)
-        y = r * np.sin(theta) * np.sin(phi)
-        z = r * np.cos(theta)
+        sigma_x = np.sqrt(k * np.mean(self.T) / (Rb87.mass * (self.trap.omega_x**2 + epsilon)))
+        sigma_y = np.sqrt(k * np.mean(self.T) / (Rb87.mass * (self.trap.omega_y**2 + epsilon)))
+        sigma_z = np.sqrt(k * np.mean(self.T) / (Rb87.mass * (self.trap.omega_z**2 + epsilon)))
+        
+        x = np.random.normal(0, sigma_x, self.N)
+        y = np.random.normal(0, sigma_y, self.N)
+        z = np.random.normal(0, sigma_z, self.N)
         
         return np.column_stack((x, y, z))
         
@@ -196,11 +156,7 @@ class AtomCloud:
         if self.positions is None or self.velocities is None:
             logging.error("Positions or velocities are None in update method")
             raise ValueError("Invalid atom cloud state")
-        
         self.positions += self.velocities * dt
-        # Enforce vacuum chamber boundary and update velocities for bounced atoms
-        self.positions, self.velocities = self.vacuum_chamber.enforce_boundary(self.positions, self.velocities)
-        
         self.update_temperature()
         self.check_consistency()
 
@@ -411,13 +367,8 @@ class AtomCloud:
             logging.error("One or more attributes are None in check_consistency")
             raise ValueError("Invalid atom cloud state")
         if not all(len(attr) == self.N for attr in attributes):
-            logging.error(f"Inconsistent lengths in AtomCloud attributes: N={self.N}, "
-                          f"positions={len(self.positions)}, velocities={len(self.velocities)}, "
-                          f"T={len(self.T)}, light_shift={len(self.light_shift)}, "
-                          f"F={len(self.F)}, m_F={len(self.m_F)}")
+            logging.error("Inconsistent lengths in AtomCloud attributes")
             raise ValueError("Inconsistent AtomCloud state")
-
-
         
     # In the AtomCloud class, modify the calculate_density method:
     def calculate_density(self):
@@ -432,7 +383,7 @@ class AtomCloud:
         """Calculate the temperature of each atom in the cloud."""
         if self.N == 0:
             logging.warning("Attempting to calculate temperature with zero atoms.")
-            return 0.0
+            return np.array([0.0])
         
         velocities_squared = np.sum(self.velocities**2, axis=1)
         T = (Rb87.mass * velocities_squared) / (3 * k)
@@ -440,8 +391,6 @@ class AtomCloud:
         if np.any(T < 0):
             logging.error(f"Calculated negative temperature: {T}")
             T = np.maximum(T, 1e-9)  # Set a minimum temperature of 1 nK
-        
-        return np.mean(T)
 
 
     def update_atom_number(self, new_N):
@@ -449,24 +398,28 @@ class AtomCloud:
             old_N = self.N
             new_N = int(max(round(new_N), 1))  # Round and ensure at least one atom
             
-            if self.N < old_N:
-                # Remove excess atoms
-                self.positions = self.positions[:self.N]
-                self.velocities = self.velocities[:self.N]
-                self.T = self.T[:self.N]
-                self.light_shift = self.light_shift[:self.N]
-            elif self.N > old_N:
-                # Add new atoms
-                additional_count = self.N - old_N
+            # Check for drastic changes in atom number
+            if abs(new_N - old_N) / old_N > self.max_atom_change_ratio:
+                logging.warning(f"Large change in atom number detected: {old_N} to {new_N}")
+                new_N = int(old_N * (1 + np.sign(new_N - old_N) * self.max_atom_change_ratio))
+            
+            if new_N < self.N:
+                indices = np.random.choice(self.N, new_N, replace=False)
+                self.positions = self.positions[indices]
+                self.velocities = self.velocities[indices]
+                self.T = self.T[indices]
+                self.light_shift = self.light_shift[indices]
+                self.F = self.F[indices]
+                self.m_F = self.m_F[indices]
+            elif new_N > self.N:
+                additional_count = new_N - self.N
                 new_positions = self.initialize_positions()[:additional_count]
                 new_velocities = self.initialize_velocities()[:additional_count]
-                self.positions = np.vstack((self.positions, new_positions))
-                self.velocities = np.vstack((self.velocities, new_velocities))
-                self.T = np.concatenate((self.T, np.full(additional_count, np.mean(self.T))))
-                self.light_shift = np.concatenate((self.light_shift, np.zeros(additional_count)))
+                self.add_atoms(additional_count, new_positions, new_velocities)
             
+            self.N = new_N
             self.check_consistency()
-                
+            
             #if new_N != old_N:
             #    logging.info(f"Atom number updated: {old_N} -> {new_N}")
         except Exception as e:
@@ -590,13 +543,6 @@ class TiltedDipleTrap:
     def get_trap_center(self):
         # Return the position of the trap center
         return np.array([0, 0, 0])
-    
-    def get_potential(self, x, y, z):
-        r = np.sqrt(x**2 + y**2 + z**2)
-        U_y = self.P_y * 2 * self.alpha / (np.pi * c * epsilon_0 * self.w_y**2) * np.exp(-2 * r**2 / self.w_y**2)
-        U_z = self.P_z * 2 * self.alpha / (np.pi * c * epsilon_0 * self.w_z**2) * np.exp(-2 * r**2 / self.w_z**2)
-        U_g = Rb87.mass * g * z * np.cos(self.tilt_angle)
-        return -(U_y + U_z) + U_g
 
 
 def photoassociation_loss_rate(delta, intensity):
@@ -650,7 +596,7 @@ def implement_cooling_stage(atoms, stage_params):
             # 1. Raman Cooling
             atoms = apply_raman_cooling(atoms, current_params['P_R'], current_params['P_p'], 
                                         current_params.get('delta', -4.33e9), current_params['B_z'], time_step)
-            """
+            
             # 2. Subrecoil Cooling
             if stage in ['S2', 'X1', 'X2', 'X3']:
                 atoms = apply_subrecoil_cooling(atoms, current_params)
@@ -679,7 +625,7 @@ def implement_cooling_stage(atoms, stage_params):
             # Log progress
             if step % 1000 == 0:
                 log_stage_progress(atoms, stage, t)
-            """
+                
         except Exception as e:
             logging.error(f"Error in {stage} at t={t}: {str(e)}")
             raise
@@ -714,8 +660,39 @@ def update_parameters(params, t, duration):
 def apply_raman_cooling(atoms, P_R, P_p, delta, B_z, dt, beam_angle=np.pi/2):
     """
     Implement the two-step Raman cooling process.
+    
+    Parameters:
+    atoms (AtomCloud): The atom cloud object
+    P_R (float): Power of the Raman coupling beam
+    P_p (float): Power of the optical pumping beam
+    delta (float): Detuning from the atomic resonance
+    B_z (float): Magnetic field strength
+    dt (float): Time step
+    beam_angle (float): Angle between Raman beams (default: π/2)
     """
-    pass
+    # Calculate temperature before cooling
+    T_before = atoms.calculate_temperature()
+    logging.info(f"Temperature before Raman cooling: {T_before*1e6:.2f} μK")
+
+
+    k_eff = 4 * np.pi / Rb87.wavelength_D1 * np.sin(beam_angle/2)
+    Omega_R = calculate_rabi_frequency(P_R)
+    gamma_sc = calculate_scattering_rate(P_p, delta)
+    
+    light_shift_R = calculate_light_shift(P_R, delta, 'raman')
+    light_shift_p = calculate_light_shift(P_p, delta, 'op')
+    delta_eff = calculate_delta_R(B_z) + light_shift_R - light_shift_p
+    
+    raman_transition(atoms, k_eff, delta_eff, Omega_R, dt, beam_angle)
+    optical_pumping(atoms, gamma_sc, dt)
+
+    # Calculate temperature after cooling
+    T_after = atoms.calculate_temperature()
+    logging.info(f"Temperature after Raman cooling: {T_after*1e6:.2f} μK")
+    
+    # Calculate and log the temperature change
+    delta_T = T_after - T_before
+    logging.info(f"Temperature change: {delta_T*1e6:.2f} μK")
 
 def calculate_rabi_frequency(P_R):
     """Calculate the Rabi frequency for the Raman transition."""
@@ -729,9 +706,9 @@ def calculate_scattering_rate(P_p, delta):
     intensity = P_p / beam_area
     s = intensity / Rb87.I_sat
     return Rb87.gamma_D1 / 2 * s / (1 + s + 4 * (delta / Rb87.gamma_D1)**2)
-    """
+
 def calculate_light_shift(P, delta, beam_type='raman'):
-    # Calculate the light shift induced by a beam.
+    """Calculate the light shift induced by a beam."""
     if beam_type == 'raman':
         intensity = calculate_beam_intensity(P, BeamParameters.raman_waist)
     elif beam_type == 'op':
@@ -739,7 +716,7 @@ def calculate_light_shift(P, delta, beam_type='raman'):
     else:
         raise ValueError("Invalid beam type. Use 'raman' or 'op'.")
     return hbar * Rb87.gamma_D1**2 * intensity / (8 * delta * Rb87.I_sat)
-    """
+
 def calculate_beam_intensity(P, wx, wy=None):
     """Calculate the peak intensity of a beam."""
     if wy is None:
@@ -771,7 +748,37 @@ def raman_transition(atoms, k_eff, delta_eff, Omega_R, dt, beam_angle):
 
 def optical_pumping(atoms, gamma_sc, dt):
     """Perform optical pumping to restore the original atomic state."""
-    pass
+    pump_mask = np.random.random(atoms.N) < (1 - np.exp(-gamma_sc * dt))
+    n_pumped = np.sum(pump_mask)
+    
+    if n_pumped > 0:
+        recoil_velocity = Rb87.vr_D1
+        for _ in range(3):  # On average, 3 photons are scattered during optical pumping
+            random_directions = np.random.randn(n_pumped, 3)
+            random_directions /= np.linalg.norm(random_directions, axis=1)[:, np.newaxis]
+            atoms.velocities[pump_mask] += recoil_velocity * random_directions
+            
+            # Simulate probabilistic m_F state changes
+            m_F_changes = np.random.choice([-1, 0, 1], size=n_pumped, p=[1/3, 1/3, 1/3])
+            atoms.m_F[pump_mask] += m_F_changes
+            
+            # Ensure m_F stays within allowed range
+            atoms.m_F[pump_mask] = np.clip(atoms.m_F[pump_mask], -2, 2)
+    
+    # Reset F state to F=2 for all pumped atoms
+    atoms.F[pump_mask] = Rb87.ground_state_F2
+
+
+
+
+
+
+
+
+
+
+
+
 
 def calculate_branching_ratio(T, N, trap_frequencies):
     """Calculate branching ratio with bosonic enhancement."""
@@ -814,7 +821,7 @@ def calculate_festina_lente_factor(atoms, reabsorption_prob, gamma_sc):
 
 
 
-def mot_loading_and_compression_and_gray_molasses(atoms, trap, vacuum_chamber, P_y, P_z, B_z):
+def mot_loading_and_compression_and_gray_molasses(atoms, trap, P_y, P_z, B_z):
     if atoms is None or atoms.N == 0:
         logging.error("Invalid atom cloud passed to MOT loading function")
         raise ValueError("Invalid atom cloud")
@@ -825,30 +832,28 @@ def mot_loading_and_compression_and_gray_molasses(atoms, trap, vacuum_chamber, P
     
     # MOT Loading parameters
     loading_time = 0.089  # 89 ms loading time
-    compression_time = 0.01  # 10 ms compression time
-    gray_molasses_time = 0.001  # 1 ms gray molasses time
-    total_time = loading_time + compression_time + gray_molasses_time
-    
-    # Time array
-    t_array = np.arange(0, total_time, dt)
-    num_steps = len(t_array)
-    
-    # Precompute time-dependent parameters
+    loading_rate = 3036707 # Loading rate (atoms/s)
     mot_detuning = -2 * 2 * np.pi * 6.065e6  # Initial detuning (2Γ red-detuned)
-    final_detuning = -10 * 2 * np.pi * 6.065e6  # Final detuning (10Γ red-detuned)
-    gray_molasses_detuning = 3 * 2 * np.pi * 5.746e6  # Blue detuning from F=2 to F'=2 on D1 line
-    
     mot_intensity = 10 * Rb87.I_sat_D2  # Initial intensity (10 I_sat)
+    B_gradient = 10  # Magnetic field gradient (G/cm)
+    repump_intensity = 0.1 * Rb87.I_sat_D2  # Repump laser intensity
+    
+    # MOT Compression parameters
+    compression_time = 0.01  # 10 ms compression time
+    final_detuning = -10 * 2 * np.pi * 6.065e6  # Final detuning (10Γ red-detuned)
     final_intensity = 1 * Rb87.I_sat_D2  # Final intensity (1 I_sat)
+    final_B_gradient = 50  # Final magnetic field gradient (G/cm)
+    
+    
+    # Gray Molasses parameters
+    gray_molasses_time = 0.001  # 1 ms gray molasses time
+    gray_molasses_detuning = 3 * 2 * np.pi * 5.746e6  # Blue detuning from F=2 to F'=2 on D1 line
     gray_molasses_intensity = 2 * Rb87.I_sat_D1  # Intensity for gray molasses
     
-    B_gradient = 10  # Initial magnetic field gradient (G/cm)
-    final_B_gradient = 50  # Final magnetic field gradient (G/cm)
-
-    beam_waist = 0.01  # 1 cm beam waist
-    repump_intensity = 0.1 * Rb87.I_sat_D2  # Repump intensity
-    repump_detuning = 0  # On resonance with F=1 to F'=2 transition
+    # Time array
+    t_array = np.arange(0, loading_time + compression_time + gray_molasses_time, dt)
     
+    # Precompute time-dependent parameters
     detuning = np.concatenate([
         np.full(int(loading_time/dt), mot_detuning),
         np.linspace(mot_detuning, final_detuning, int(compression_time/dt)),
@@ -865,186 +870,130 @@ def mot_loading_and_compression_and_gray_molasses(atoms, trap, vacuum_chamber, P
         np.full(int(gray_molasses_time/dt), final_B_gradient)
     ])
     
-    # Ensure arrays have the correct length
-    detuning = np.resize(detuning, num_steps)
-    intensity = np.resize(intensity, num_steps)
-    B_grad = np.resize(B_grad, num_steps)
-    
-    # Initialize the MOT with a gas cloud at room temperature
-    N_initial = N_atoms_initial  # Initial number of atoms in the gas cloud
-    # In the mot_loading_and_compression_and_gray_molasses function:
-    initial_positions, initial_velocities = generate_initial_positions_and_velocities(N_initial, vacuum_chamber, room_temperature)
-
-    # Create initial atom cloud
-    atoms = AtomCloud(N_initial, room_temperature, trap, vacuum_chamber)
-    atoms.positions = initial_positions
-    atoms.velocities = initial_velocities
-
     logging.info(f"Starting MOT loading and compression with {atoms.N} atoms at {np.mean(atoms.T)*1e6:.2f} μK")
-
-    atom_data=[]
-    trap_data=[]
+    # MOT beam waist (you may need to adjust this value)
+    mot_beam_waist = 0.01  # 10 mm, typical for MOT beams
 
     try:
-
-        # Use a smaller time step at the beginning
-        initial_dt = dt / 100  # Start with a much smaller time step
-        adaptive_dt = initial_dt
-        max_dt = dt  # Maximum allowed time step
-
-
         # Main simulation loop
         for i, t in enumerate(t_array):
-                # Gradually increase the time step
-            adaptive_dt = min(adaptive_dt * 1.01, max_dt)
-
+            try:
+                # Load atoms
+                if t < loading_time:
+                    new_atoms = int(loading_rate * dt)
+                    # Generate velocities corresponding to room temperature
+                    sigma_v = np.sqrt(k_B * room_temperature / Rb87.mass)
+                    new_velocities = np.random.normal(0, sigma_v, (new_atoms, 3))
+                    new_positions = np.random.uniform(-0.01, 0.01, (new_atoms, 3))
+                    
+                    old_mean_temp = np.mean(atoms.T)
+                    old_N = atoms.N
+                    atoms.add_atoms(new_atoms, new_positions, new_velocities, room_temperature)
+                    
+                    #logging.info(f"Added {new_atoms} atoms. Old mean T: {old_mean_temp*1e6:.2f} μK, New mean T: {np.mean(atoms.T)*1e6:.2f} μK")
+                    #logging.info(f"Old N: {old_N}, New N: {atoms.N}")
+                
             # Apply forces
-            if t < loading_time:
-                cooling_force = calculate_mot_force(atoms.positions, atoms.velocities, 
-                                                    detuning[i], intensity[i], B_grad[i],
-                                                    repump_intensity, repump_detuning, beam_waist)
-            elif t < loading_time + compression_time:
-                print("t: ", t * 1000)
-                atoms = compressed_mot_stage(atoms, compression_time, 
-                                            mot_detuning, final_detuning, 
-                                            B_gradient, final_B_gradient,
-                                            mot_intensity, final_intensity,
-                                            repump_intensity, repump_detuning, beam_waist)
-                continue  # Skip the rest of the loop as atoms have been updated in compressed_mot_stage
-            else:
-                cooling_force = calculate_gray_molasses_force(atoms.velocities, detuning[i], intensity[i])
-            
-            # Ensure cooling_force has the same shape as atoms.velocities
-            if cooling_force.shape != atoms.velocities.shape:
-                logging.warning(f"Shape mismatch: cooling_force {cooling_force.shape}, velocities {atoms.velocities.shape}")
-                cooling_force = cooling_force[:atoms.velocities.shape[0]]
-            
-            atoms.velocities += cooling_force * adaptive_dt / Rb87.mass
-            
-            # Update positions and temperature
-            atoms.update(adaptive_dt)
-            atoms.update_temperature()
-            
-            # Apply atom losses
-            density = atoms.calculate_density()
-            loss_rates = {
-                'background': calculate_background_loss_rate(),
-                'light_assisted': calculate_light_assisted_collision_rate(intensity[i], density),
-                'three_body': calculate_three_body_loss_rate(density, np.mean(atoms.T))
-            }
-            atoms.apply_losses(loss_rates, adaptive_dt)
-            
-            # Apply temperature limits
-            if t < loading_time + compression_time:
-                T_doppler = -hbar * detuning[i] / (2 * k_B)
-                atoms.T = np.maximum(atoms.T, T_doppler)
-            else:
-                T_sub_doppler = hbar * Rb87.gamma_D1 / (2 * k_B)
-                atoms.T = np.maximum(atoms.T * np.exp(-adaptive_dt / 1e-3), T_sub_doppler)
+                if t < loading_time + compression_time:
+                    cooling_force = calculate_mot_force(atoms.positions, atoms.velocities, detuning[i], 
+                                                        intensity[i], B_grad[i], repump_intensity, mot_beam_waist)
+                else:
+                    cooling_force = calculate_gray_molasses_force(atoms.velocities, detuning[i], intensity[i])
+                print(atoms.T)
+                atoms.velocities += cooling_force * dt / Rb87.mass
+                
+                # Update positions and temperature
+                atoms.update(dt)
+                
+                # Apply atom losses
+                density = atoms.calculate_density()
+                loss_rates = {
+                    'background': calculate_background_loss_rate(),
+                    'light_assisted': calculate_light_assisted_collision_rate(intensity[i], density),
+                    'three_body': calculate_three_body_loss_rate(density, np.mean(atoms.T))
+                }
+                atoms.apply_losses(loss_rates, dt)
+                
+                # Apply temperature limits
+                if t < loading_time + compression_time:
+                    T_doppler = -hbar * detuning[i] / (2 * k_B)
+                    atoms.T = np.maximum(atoms.T, T_doppler)
+                else:
+                    T_sub_doppler = hbar * Rb87.gamma_D1 / (2 * k_B)
+                    atoms.T = np.maximum(atoms.T * np.exp(-dt / 1e-3), T_sub_doppler)
+                
+                atoms.check_consistency()
+                # Log progress at key points
+                if i % int(0.01 / dt) == 0:  # Log every 10 ms
+                    logging.info(f"Time: {t*1000:.1f} ms, Atoms: {atoms.N}, Temperature: {np.mean(atoms.T)*1e6:.2f} μK")
+                    logging.debug(f"Atom positions shape: {atoms.positions.shape}, velocities shape: {atoms.velocities.shape}")
 
-            atoms.check_consistency()
+            except Exception as e:
+                logging.error(f"Error in MOT loop at time {t*1000:.1f} ms: {str(e)}")
+                raise
 
-            # Store atom_data and trap_data
-            if i % int(0.001 / dt) == 0:  # Store data every 1 ms
-                atom_data.append((t, atoms.positions.copy(), atoms.T.copy()))
-                trap_data.append((t, P_y[i], P_z[i], B_z[i]))
-            
-            # Log progress at key points
-            if i % int(0.01 / dt) == 0:  # Log every 10 ms
-                logging.info(f"Time: {t*1000:.1f} ms, Atoms: {atoms.N}, Temperature: {np.mean(atoms.T)*1e6:.2f} μK")
+                
+        # Final state
+        final_temp = np.mean(atoms.T)
+        logging.info(f"MOT and gray molasses complete. Final atoms: {atoms.N}, Final temperature: {final_temp*1e6:.2f} μK")
 
+        # Check if we've achieved the desired outcome
+        if abs(atoms.N - 2.7e5) / 2.7e5 < 0.05 and abs(final_temp - 30e-6) / 30e-6 < 0.05:
+            logging.info("Desired outcome achieved!")
+        else:
+            logging.info("Desired outcome not achieved. Consider adjusting parameters:")
+            if atoms.N < 2.7e5:
+                logging.info("  - Increase loading_rate or loading_time")
+            elif atoms.N > 2.7e5:
+                logging.info("  - Decrease loading_rate or loading_time")
+            if final_temp < 30e-6:
+                logging.info("  - Adjust cooling parameters (e.g., increase detuning or reduce cooling time)")
+            elif final_temp > 30e-6:
+                logging.info("  - Adjust cooling parameters (e.g., decrease detuning or increase cooling time)")
+        
     except Exception as e:
-        logging.error(f"Error in MOT loop at time {t*1000:.1f} ms: {str(e)}")
+        logging.error(f"Error in mot_loading_and_compression_and_gray_molasses: {str(e)}")
+        logging.error(f"Atom cloud state: N={atoms.N}, T shape={atoms.T.shape if atoms.T is not None else None}")
         raise
 
-    # Final state
-    final_temp = np.mean(atoms.T)
-    logging.info(f"MOT and gray molasses complete. Final atoms: {atoms.N}, Final temperature: {final_temp*1e6:.2f} μK")
-
-    return atoms, atom_data, trap_data
-
-def calculate_mot_force(positions, velocities, detuning, intensity, B_gradient, repump_intensity, repump_detuning, beam_waist):
-    k = 2 * np.pi / Rb87.wavelength_D2
-    gamma = Rb87.gamma_D2
+    return atoms
     
+
+def calculate_mot_force(positions, velocities, detuning, intensity, B_gradient, repump_intensity, beam_waist):
+ 
+     # Constants
+    k = 2 * np.pi / Rb87.wavelength_D2  # Wave number
+    gamma = Rb87.gamma_D2  # Natural linewidth
+    s0 = intensity / Rb87.I_sat_D2  # Peak saturation parameter
+    
+    # Magnetic field
+    B = B_gradient * np.sqrt(positions[:, 0]**2 + positions[:, 1]**2 + 4 * positions[:, 2]**2)
+    
+    # Beam directions
     beam_directions = np.array([[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]])
     
-    B = calculate_magnetic_field(positions, B_gradient)
-    beam_intensity = calculate_beam_intensity(positions, intensity, beam_waist)
-    
-    s0_total = 6 * beam_intensity / Rb87.I_sat_D2
-    
-    doppler_shifts = np.dot(velocities, beam_directions.T)
-    delta = detuning - k * doppler_shifts + Rb87.mu_B * Rb87.g_F * B[:, np.newaxis] / hbar
-    
-    R = (gamma / 2) * s0_total[:, np.newaxis] / (1 + s0_total[:, np.newaxis] + 4 * (delta / gamma)**2)
-    
-    F_cool = -hbar * k * np.sum(R[:, :, np.newaxis] * beam_directions, axis=1)
+    # Initialize forces
+    F_cool = np.zeros_like(positions)
+    F_trap = np.zeros_like(positions)
+
+    for direction in beam_directions:
+        # Calculate beam intensity at atom positions
+        r_squared = np.sum((positions - np.dot(positions, direction)[:, np.newaxis] * direction)**2, axis=1)
+        s = s0 * np.exp(-2 * r_squared / beam_waist**2)
+        
+        # Detuning including Zeeman shift and Doppler shift
+        delta = detuning - k * np.dot(velocities, direction) + Rb87.mu_B * Rb87.g_F * B / hbar
+        
+        # Scattering rate
+        R = (gamma / 2) * s / (1 + s + 4 * (delta / gamma)**2)
+        
+        # Cooling force
+        F_cool += -hbar * k * R[:, np.newaxis] * direction
+
+    # Trapping force
     F_trap = Rb87.mu_B * Rb87.g_F * B_gradient * np.column_stack((positions[:, 0], positions[:, 1], -2 * positions[:, 2]))
     
-    repump_rate = calculate_repump_effect(positions, velocities, repump_intensity, repump_detuning)
-    repump_factor = repump_rate / (repump_rate + gamma)
-    
-    logging.debug(f"F_cool shape: {F_cool.shape}, F_trap shape: {F_trap.shape}, repump_factor shape: {repump_factor.shape}")
-    
-    F_total = (F_cool + F_trap) * repump_factor[:, np.newaxis]
-    
-    logging.debug(f"F_total shape: {F_total.shape}")
-    
-    return F_total
-
-def calculate_magnetic_field(positions, B_gradient):
-    r = np.sqrt(np.sum(positions**2, axis=1))
-    B0 = 1e-4  # Tesla, typical MOT field at the center
-    R0 = 0.01  # meters, characteristic distance for field decay
-    B = B0 + B_gradient * r * np.exp(-r / R0)
-    return B
-
-def calculate_beam_intensity(positions, intensity, beam_waist):
-    r_squared = np.sum(positions**2, axis=1)
-    beam_radius = 5 * beam_waist  # Beam cut-off at 5 times the waist
-    beam_intensity = np.where(r_squared < beam_radius**2,
-                              intensity * np.exp(-2 * r_squared / beam_waist**2),
-                              0)
-    return beam_intensity
-
-def calculate_repump_effect(positions, velocities, repump_intensity, repump_detuning):
-    k_repump = 2 * np.pi / Rb87.wavelength_D1
-    gamma_repump = Rb87.gamma_D1
-    s0_repump = repump_intensity / Rb87.I_sat_D1
-    
-    r_squared = np.sum(positions**2, axis=1)
-    beam_radius = 0.01  # 1 cm radius for repump beam
-    repump_profile = np.where(r_squared < beam_radius**2, 1, 0)
-    
-    doppler_shift = k_repump * velocities[:, 2]  # Assuming repump along z-axis
-    delta_repump = repump_detuning - doppler_shift
-    
-    repump_rate = (gamma_repump / 2) * s0_repump * repump_profile / (1 + s0_repump + 4 * (delta_repump / gamma_repump)**2)
-    
-    return repump_rate.flatten()  # Ensure the output is a 1D array
-
-
-def compressed_mot_stage(atoms, duration, initial_detuning, final_detuning, initial_B_gradient, final_B_gradient, initial_intensity, final_intensity, repump_intensity, repump_detuning, beam_waist):
-    for t in np.arange(0, duration, dt):
-        progress = t / duration
-        current_detuning = initial_detuning + (final_detuning - initial_detuning) * progress
-        current_B_gradient = initial_B_gradient + (final_B_gradient - initial_B_gradient) * progress
-        current_intensity = initial_intensity + (final_intensity - initial_intensity) * progress
-        
-        # Apply compressed MOT forces
-        cooling_force = calculate_mot_force(atoms.positions, atoms.velocities, 
-                                            current_detuning, current_intensity, current_B_gradient, 
-                                            repump_intensity, repump_detuning, beam_waist)
-        atoms.velocities += cooling_force * dt / Rb87.mass
-        
-        atoms.update(dt)
-    
-    return atoms
-
-
-
-
+    return F_cool + F_trap
 
 def calculate_gray_molasses_force(velocities, detuning, intensity):
     # Constants
@@ -1053,8 +1002,7 @@ def calculate_gray_molasses_force(velocities, detuning, intensity):
     s = intensity / Rb87.I_sat_D1  # Saturation parameter
     
     # Detuning including Doppler shift
-    v_magnitude = np.linalg.norm(velocities, axis=1)
-    delta = detuning - k * v_magnitude
+    delta = detuning - k * np.linalg.norm(velocities, axis=1)
     
     # Λ-enhanced cooling force (simplified model)
     omega_R = gamma * np.sqrt(s/2)  # Rabi frequency
@@ -1064,8 +1012,7 @@ def calculate_gray_molasses_force(velocities, detuning, intensity):
     F_vscpt = -hbar * k * s * np.exp(-(delta/gamma)**2)
     
     # Combine forces and expand to 3D
-    # Add a small value to avoid division by zero
-    F_total = (F_lambda + F_vscpt)[:, np.newaxis] * velocities / (v_magnitude[:, np.newaxis] + 1e-10)
+    F_total = (F_lambda + F_vscpt)[:, np.newaxis] * velocities / np.linalg.norm(velocities, axis=1)[:, np.newaxis]
     
     return F_total
 
@@ -1131,33 +1078,7 @@ def detect_bec(atoms):
         condensate_fraction = 0
     return condensate_fraction
 
-def generate_initial_positions_and_velocities(N_initial, vacuum_chamber, room_temperature):
-    # Generate positions uniformly within a sphere
-    r = vacuum_chamber.radius * np.cbrt(np.random.random(N_initial))
-    theta = np.arccos(2 * np.random.random(N_initial) - 1)
-    phi = 2 * np.pi * np.random.random(N_initial)
-    
-    x = r * np.sin(theta) * np.cos(phi)
-    y = r * np.sin(theta) * np.sin(phi)
-    z = r * np.cos(theta)
-    
-    initial_positions = np.column_stack((x, y, z))
-    
-    # Generate velocities from Maxwell-Boltzmann distribution
-    sigma_v = np.sqrt(k * room_temperature / Rb87.mass)
-    initial_velocities = np.random.normal(0, sigma_v, (N_initial, 3))
-    
-    # Verify that all positions are inside the chamber
-    distances = np.linalg.norm(initial_positions, axis=1)
-    if np.any(distances > vacuum_chamber.radius):
-        logging.warning(f"Found {np.sum(distances > vacuum_chamber.radius)} initial positions outside the chamber. Adjusting...")
-        # Scale positions to ensure they're all inside
-        scale_factor = vacuum_chamber.radius / np.max(distances)
-        initial_positions *= scale_factor
-    
-    logging.info(f"Generated {N_initial} initial positions. Max distance from center: {np.max(np.linalg.norm(initial_positions, axis=1)):.6f} m")
-    
-    return initial_positions, initial_velocities
+
 
 
 
@@ -1178,8 +1099,6 @@ def run_full_sequence(params):
     P_R_values = np.where(time_array < mot_time, 0, P_R_interp(time_array - mot_time))
     P_p_values = np.where(time_array < mot_time, 0, P_p_interp(time_array - mot_time))
     B_z_values = np.where(time_array < mot_time, 0, B_z_interp(time_array - mot_time))
-
-    
     
     try:
         tilt_angle = 17 * np.pi / 180  # 17 degrees tilt
@@ -1188,22 +1107,16 @@ def run_full_sequence(params):
         initial_P_y, initial_P_z = P_y_interp(0), P_z_interp(0)  # Initial powers in Watts
         trap = TiltedDipleTrap(initial_P_y, initial_P_z, 18e-6, 14e-6, 1064e-9, tilt_angle)
         
-        
-        # Create spherical vacuum chamber
-        vacuum_chamber = VacuumChamber(radius=0.05)  # 5cm radius chamber
-        
-        atoms = AtomCloud(N_atoms_initial, T_initial, trap, vacuum_chamber)
+        atoms = AtomCloud(N_atoms_initial, T_initial, trap)
         
         sigma_minus_beam = LaserBeam(P_p_interp(0), 30e-6, 1e-3, Rb87.wavelength_D1, direction=[0, 0, 1])
         pi_beam = LaserBeam(P_R_interp(0), 0.5e-3, 0.5e-3, Rb87.wavelength_D1, direction=[0, 0, -1])
         
-        # Initialize data collection lists
-        atom_data = []
-        trap_data = []
         results = []
         trap_frequencies = []
         cooling_efficiencies = []
         condensate_fractions = []
+        times = []
 
         # Generate arrays for P_y, P_z, and B_z for the MOT and gray molasses stages
         mot_steps = int(mot_time / dt)
@@ -1213,83 +1126,100 @@ def run_full_sequence(params):
 
 
         # 1. & 2. MOT loading and compression phase and gray_molasses
-        atoms, atom_data, trap_data = mot_loading_and_compression_and_gray_molasses(atoms, trap, vacuum_chamber, P_y_mot, P_z_mot, B_z_mot)
+        atoms = mot_loading_and_compression_and_gray_molasses(atoms, trap, P_y_mot, P_z_mot, B_z_mot)
         
        
-        # Calculate temperature before cooling
+         # Calculate temperature before cooling
         T_after_mot = atoms.calculate_temperature()
-        if T_after_mot is not None:
-            logging.info(f"Temperature after MOT Loading: {T_after_mot*1e6:.2f} μK")
-        else:
-            logging.warning("Unable to calculate temperature after MOT Loading.")
+        logging.info(f"Temperature after Mot Loading: {T_after_mot*1e6:.2f} μK")
 
         
         results.append(calculate_observables(atoms))
         trap_frequencies.append((trap.omega_x, trap.omega_y, trap.omega_z))
-
+        times.append(0.1)
 
 
         logging.info(f"After MOT: N = {atoms.N:.2e}, mean T = {np.mean(atoms.T)*1e6:.2f} μK")
-        
-        # Main cooling and evaporation loop
-        current_stage = 'S1'# Define cooling stage boundaries
+
+        # Define cooling stage boundaries
         stage_start_times = [0.1, 0.163, 0.225, 0.288, 0.351, 0.414, 0.441, 0.468, 0.495, 0.522, 0.549]
         stage_names = ['S1', 'S2', 'X1', 'X2', 'X3', 'Evaporation1', 'Evaporation2', 'Evaporation3', 'Evaporation4', 'Evaporation5', 'Evaporation6']
+
+
+        # Main cooling and evaporation loop
+        """"
+        Need Implementation
         """
-        for t in time_array[time_array >= mot_time]:
-            # Update trap parameters
-            trap.update_powers(P_y_interp(t), P_z_interp(t))
-            atoms.apply_magnetic_field(B_z_interp(t))
-            
-            # Determine current stage
-            if t >= stage_start_times[-1]:
-                current_stage = stage_names[-1]
-            else:
-                current_stage = stage_names[np.searchsorted(stage_start_times, t) - 1]
-            
-            # Apply cooling and evaporation based on current stage
-            if current_stage.startswith('S') or current_stage.startswith('X'):
-                atoms = apply_raman_cooling(atoms, P_R_interp(t), P_p_interp(t), -4.33e9, B_z_interp(t), dt)
-                if current_stage in ['S2', 'X1', 'X2', 'X3']:
-                    atoms = apply_subrecoil_cooling(atoms, calculate_effective_recoil_velocity(atoms))
-            elif current_stage.startswith('Evaporation'):
-                atoms = apply_evaporative_cooling(atoms, trap.calculate_trap_depth())
-            
-            # Apply losses and update atoms
-            atoms.apply_light_assisted_collisions(P_p_interp(t), -4.33e9)
-            atoms.apply_three_body_recombination()
-            atoms.update(dt)
-            
-            print(atoms)
-            # Collect data every 1 ms
-            if np.isclose(t % 0.001, 0, atol=dt/2):
-                atom_data.append((t, atoms.positions.copy(), atoms.T.copy()))
-                trap_data.append((t, trap.P_y, trap.P_z, B_z_interp(t)))
-                results.append(calculate_observables(atoms))
-                trap_frequencies.append((trap.omega_x, trap.omega_y, trap.omega_z))
-                cooling_efficiencies.append(calculate_cooling_efficiency(results[-2:]))
-                condensate_fractions.append(detect_bec(atoms))
-            
-            # Log progress every 10 ms
-            if np.isclose(t % 0.01, 0, atol=dt/2):
-                logging.info(f"Time: {t:.3f}s, Stage: {current_stage}, N: {atoms.N}, T: {np.mean(atoms.T)*1e6:.2f}µK")
-            """
+        
+        
+        # 3. Transfer to single-beam ODT
+        # (This is implicitly done as we're already in the ODT)
+        
+        # 4. Raman cooling stages in single-beam ODT
+        # S1: Initial fast cooling
+        implement_cooling_stage(atoms, {'stage': 'S1', 'duration': 0.063})
+        results.append(calculate_observables(atoms))
+        trap_frequencies.append((trap.omega_x, trap.omega_y, trap.omega_z))
+        times.append(0.2)
+        
+        # S2: Continued cooling with reduced trap power
+        implement_cooling_stage(atoms, {'stage': 'S2', 'duration': 0.063})
+        results.append(calculate_observables(atoms))
+        trap_frequencies.append((trap.omega_x, trap.omega_y, trap.omega_z))
+        times.append(0.3)
+        
+        # 5. Transfer to crossed ODT
+        crossed_trap = TiltedDipleTrap(P_y_interp(0.3), P_z_interp(0.3), 18e-6, 14e-6, 1064e-9, tilt_angle)
+        load_crossed_odt(atoms, trap, crossed_trap, 0.04)
+        trap = crossed_trap
+        
+        # 6. Raman cooling stages in crossed ODT
+        # X1: Initial cooling in crossed ODT
+        implement_cooling_stage(atoms, {'stage': 'X1', 'duration': 0.04})
+        results.append(calculate_observables(atoms))
+        trap_frequencies.append((trap.omega_x, trap.omega_y, trap.omega_z))
+        times.append(0.34)
+        
+        # X2: Cooling near threshold to condensation
+        implement_cooling_stage(atoms, {'stage': 'X2', 'duration': 0.04})
+        results.append(calculate_observables(atoms))
+        trap_frequencies.append((trap.omega_x, trap.omega_y, trap.omega_z))
+        times.append(0.38)
+        
+        # X3: Final cooling to cross BEC transition
+        implement_cooling_stage(atoms, {'stage': 'X3', 'duration': 0.034})
+        results.append(calculate_observables(atoms))
+        trap_frequencies.append((trap.omega_x, trap.omega_y, trap.omega_z))
+        times.append(0.414)
+        
+        # 7. Evaporative cooling stages (six 30-ms stages)
+        for i in range(6):
+            stage_name = f'Evaporation{i+1}'
+            implement_cooling_stage(atoms, {'stage': stage_name, 'duration': 0.03})
+            results.append(calculate_observables(atoms))
+            trap_frequencies.append((trap.omega_x, trap.omega_y, trap.omega_z))
+            times.append(0.414 + (i+1)*0.03)
+        
         # Final results
         results.append(calculate_observables(atoms))
         trap_frequencies.append((trap.omega_x, trap.omega_y, trap.omega_z))
         condensate_fractions.append(detect_bec(atoms))
+        times.append(total_time)
+        
+        if len(results) > 1:
+            cooling_efficiencies.append(calculate_cooling_efficiency(results[-2], results[-1]))
         
         # Convert results to structured numpy array
         dtype = [('time', float), ('T', float), ('N', int), ('PSD', float)]
-        results_array = np.array([(t, T, N, PSD) for (T, N, PSD), (t, _, _) in zip(results, atom_data)], dtype=dtype)
+        results_array = np.array(list(zip(times, *zip(*results))), dtype=dtype)
         
         trap_frequencies_array = np.array(trap_frequencies)
         cooling_efficiencies_array = np.array(cooling_efficiencies)
         condensate_fractions_array = np.array(condensate_fractions)
         
         return (results_array, trap_frequencies_array, trap,
-                cooling_efficiencies_array, condensate_fractions_array,
-                atom_data, trap_data)
+                cooling_efficiencies_array, condensate_fractions_array)
+    
     
     except Exception as e:
         logging.error(f"Error in run_full_sequence: {e}")
@@ -1659,111 +1589,6 @@ def plot_results(results, cooling_efficiencies, condensate_fractions):
     plt.tight_layout()
     plt.show()
 
-def visualize_atom_cloud(atom_data, trap_data, trap, save_video=False):
-    fig = plt.figure(figsize=(15, 10))
-    ax = fig.add_subplot(111, projection='3d')
-    
-    # Pre-compute axis limits
-    x_min, x_max = float('inf'), float('-inf')
-    y_min, y_max = float('inf'), float('-inf')
-    z_min, z_max = float('inf'), float('-inf')
-    t_min, t_max = float('inf'), float('-inf')
-    
-    x_min, x_max = float(0.5), float(0.5)
-    y_min, y_max = float(0.5), float(0.5)
-    z_min, z_max = float(0.5), float(0.5)
-
-    valid_data = False
-    for _, positions, temperatures in atom_data:
-        if len(positions) > 0 and len(temperatures) > 0:
-            valid_data = True
-            x_min = min(x_min, positions[:, 0].min())
-            x_max = max(x_max, positions[:, 0].max())
-            y_min = min(y_min, positions[:, 1].min())
-            y_max = max(y_max, positions[:, 1].max())
-            z_min = min(z_min, positions[:, 2].min())
-            z_max = max(z_max, positions[:, 2].max())
-            t_min = min(t_min, temperatures.min())
-            t_max = max(t_max, temperatures.max())
-    
-    if not valid_data:
-        logging.warning("No valid data found in atom_data. Using default values.")
-        x_min, x_max = -1e-6, 1e-6
-        y_min, y_max = -1e-6, 1e-6
-        z_min, z_max = -1e-6, 1e-6
-        t_min, t_max = 0, 1e-6
-    
-    # Ensure limits are not identical
-    if x_min == x_max:
-        x_min -= 1e-6
-        x_max += 1e-6
-    if y_min == y_max:
-        y_min -= 1e-6
-        y_max += 1e-6
-    if z_min == z_max:
-        z_min -= 1e-6
-        z_max += 1e-6
-    if t_min == t_max:
-        t_min = 0
-        t_max = 1e-6
-    
-    # Create potential energy surface
-    x = np.linspace(x_min, x_max, 50)
-    y = np.linspace(y_min, y_max, 50)
-    X, Y = np.meshgrid(x, y)
-    Z = np.zeros_like(X)
-    
-    scatter = ax.scatter([], [], [], c=[], cmap='coolwarm', s=2)
-    potential_surface = ax.plot_surface(X, Y, Z, cmap='viridis', alpha=0.1)
-    title = ax.set_title('')
-    param_text = ax.text2D(0.05, 0.95, '', transform=ax.transAxes)
-    
-    def update(frame):
-        nonlocal potential_surface
-        if frame < len(atom_data):
-            t, positions, temperatures = atom_data[frame]
-            _, P_y, P_z, B_z = trap_data[frame] if frame < len(trap_data) else (0, 0, 0, 0)
-            
-            if len(positions) > 0 and len(temperatures) > 0:
-                scatter._offsets3d = (positions[:, 0], positions[:, 1], positions[:, 2])
-                scatter.set_array(temperatures)
-            else:
-                scatter._offsets3d = ([], [], [])
-                scatter.set_array([])
-            
-            # Update Z values for the potential surface
-            for i in range(X.shape[0]):
-                for j in range(X.shape[1]):
-                    Z[i, j] = trap.get_potential(X[i, j], Y[i, j], 0)  # Use z=0 for simplicity
-            
-            potential_surface.remove()
-            potential_surface = ax.plot_surface(X, Y, Z, cmap='viridis', alpha=0.1)
-            
-            title.set_text(f'Atom Cloud at t = {t:.3f} s')
-            param_text.set_text(f'P_y = {P_y:.2f} W\nP_z = {P_z:.2f} W\nB_z = {B_z:.2f} G')
-        
-        return scatter, potential_surface, title, param_text
-    
-    ax.set_xlim(x_min, x_max)
-    ax.set_ylim(y_min, y_max)
-    ax.set_zlim(z_min, z_max)
-    ax.set_xlabel('X (m)')
-    ax.set_ylabel('Y (m)')
-    ax.set_zlabel('Z (m)')
-    
-    fig.colorbar(scatter, label='Temperature (K)')
-    scatter.set_clim(t_min, t_max)
-    
-    anim = FuncAnimation(fig, update, frames=len(atom_data), interval=100, blit=False)
-    
-    if save_video:
-        Writer = writers['ffmpeg']
-        writer = Writer(fps=10, metadata=dict(artist='BEC Simulation Team'), bitrate=1800)
-        anim.save('bec_simulation.mp4', writer=writer)
-    
-    plt.show()
-                  
-                   
 # Make sure the validate_simulation function is defined as follows:
 def validate_simulation(results, trap_frequencies, params, trap, cooling_efficiencies, condensate_fractions):
     if np.any(np.isnan(results['PSD'])) or np.any(np.isinf(results['PSD'])):
@@ -1816,7 +1641,7 @@ def run_optimization(n_iterations=100):
                     best_cost = current_cost
                 
                 # Run a simulation with the current parameters and log the results
-                results, trap_frequencies, trap, cooling_efficiencies, condensate_fractions,atom_data, trap_data = run_full_sequence(current_params)
+                results, trap_frequencies, trap, cooling_efficiencies, condensate_fractions = run_full_sequence(current_params)
                 T_final, N_final, PSD_final = results['T'][-1], results['N'][-1], results['PSD'][-1]
                 logging.info(f"Simulation results: N = {N_final:.2e}, T = {T_final:.2e}, PSD = {PSD_final:.2e}")
             except Exception as e:
@@ -1837,31 +1662,13 @@ def initial_simulation_run():
     # Combine all parameters into a single array
     params_init = P_y_init + P_z_init + P_R_init + P_p_init + B_z_init
 
-    # Initialize variables
-    results = None
-    trap_frequencies = None
-    trap = None
-    cooling_efficiencies = None
-    condensate_fractions = None
-
-    try:
-        results, trap_frequencies, trap, cooling_efficiencies, condensate_fraction, atom_data, trap_data = run_full_sequence(params_init)
-        logging.info("Simulation completed successfully")
-        visualize_atom_cloud(atom_data, trap_data, trap, True)
-    except Exception as e:
-        logging.error(f"Error in run_full_sequence: {e}", exc_info=True)
-        return None, None, None
-
-    if results is not None and trap is not None:
-        try:
-            validate_simulation(results, trap_frequencies, params_init, trap, cooling_efficiencies, condensate_fractions)
-            logging.info("Simulation validation completed")
-        except Exception as e:
-            logging.error(f"Error in validate_simulation: {e}", exc_info=True)
+    results, trap_frequencies, trap, cooling_efficiencies, condensate_fractions = run_full_sequence(params_init)
+    
+    if results.size > 0 and trap is not None:
+        validate_simulation(results, trap_frequencies, params_init, trap, cooling_efficiencies, condensate_fractions)
     else:
-        logging.error("Simulation failed to produce valid results")
-        return None, None, None
-
+        logging.error("Simulation failed to produce valid results.")
+    
     return results, trap_frequencies, trap
 
 if __name__ == "__main__":
