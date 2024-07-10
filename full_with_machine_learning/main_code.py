@@ -75,7 +75,7 @@ class BeamParameters:
     op_waist_y = 1e-3             # 1 mm
     
 # Simulation parameters
-N_atoms_initial = int(4e5)
+N_atoms_initial = int(3.2e5)
 T_initial = 300e-6
 dt = 1e-5
 
@@ -904,7 +904,6 @@ def mot_loading_and_compression_and_gray_molasses(atoms, trap, vacuum_chamber, P
                                                     detuning[i], intensity[i], B_grad[i],
                                                     repump_intensity, repump_detuning, beam_waist)
             elif t < loading_time + compression_time:
-                print("t: ", t * 1000)
                 atoms = compressed_mot_stage(atoms, compression_time, 
                                             mot_detuning, final_detuning, 
                                             B_gradient, final_B_gradient,
