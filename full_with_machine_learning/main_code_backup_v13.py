@@ -59,7 +59,13 @@ class Rb87:
     def calculate_K3(cls, T):
         K3_0 = 4.3e-29  # cm^6/s for Rb-87 in |2, -2⟩ state
         T_scale = 100e-6  # 100 μK
-        return K3_0 * (1 + (T / T_scale)**2) * 1e-12  # Convert to m^6/s
+        
+        # Avoid potential overflow by breaking down the calculation
+        ratio = T / T_scale
+        term = 1 + ratio**2
+        
+        # Use numpy.clip to ensure the result doesn't exceed the maximum float value
+        return np.clip(K3_0 * term * 1e-12, 0, np.finfo(float).max)
 
 class BeamParameters:
     odt_horizontal_waist = 18e-6  # 18 μm
@@ -69,7 +75,9 @@ class BeamParameters:
     op_waist_y = 1e-3             # 1 mm
     
 # Simulation parameters
-N_atoms_initial = int(1e4)
+#N_atoms_initial = int(3.2e5)
+
+N_atoms_initial = int(3.2e5)
 T_initial = 300e-6
 dt = 1e-5
 
@@ -84,12 +92,42 @@ class LaserBeam:
     def intensity(self, positions):
         x, y, _ = positions.T
         return 2 * self.power / (np.pi * self.w_x * self.w_y) * np.exp(-2 * (x**2 / self.w_x**2 + y**2 / self.w_y**2))
-    
+
+
+class VacuumChamber:
+    def __init__(self, radius=0.05):
+        self.radius = radius
+        self.max_allowed_distance = 1e6 * self.radius  # Set a maximum allowed distance
+
+
+    def is_inside(self, positions):
+        # Check if positions are inside the spherical chamber
+        return np.sum(positions**2, axis=1) < self.radius**2
+
+    def enforce_boundary(self, positions, velocities):
+        distances = np.sqrt(np.sum(positions**2, axis=1))
+        outside_mask = distances > self.radius
+        far_outside_mask = distances > self.max_allowed_distance
+        
+        if np.any(far_outside_mask):
+            #logging.warning(f"Atoms detected at extreme distances. Resetting {np.sum(far_outside_mask)} atoms.")
+            positions[far_outside_mask] = np.random.uniform(-self.radius, self.radius, (np.sum(far_outside_mask), 3))
+            velocities[far_outside_mask] = np.zeros((np.sum(far_outside_mask), 3))
+        
+        if np.any(outside_mask):
+            normals = -positions[outside_mask] / distances[outside_mask, np.newaxis]
+            positions[outside_mask] = normals * self.radius + (positions[outside_mask] - normals * distances[outside_mask, np.newaxis])
+            v_parallel = np.sum(velocities[outside_mask] * normals, axis=1)[:, np.newaxis] * normals
+            velocities[outside_mask] = velocities[outside_mask] - 2 * v_parallel
+
+        return positions, velocities
+
 
 class AtomCloud:
-    def __init__(self, N, T, trap):
+    def __init__(self, N, T, trap, vacuum_chamber):
         self.N = int(max(round(N), 1))
         self.trap = trap
+        self.vacuum_chamber = vacuum_chamber
         self.T = np.full(self.N, max(T, 1e-9))  # Initialize temperature array
         self.positions = self.initialize_positions()
         self.velocities = self.initialize_velocities()
@@ -105,15 +143,14 @@ class AtomCloud:
 
 
     def initialize_positions(self):
-        epsilon = 1e-10
+        # Initialize positions uniformly within the spherical chamber
+        r = self.vacuum_chamber.radius * np.cbrt(np.random.random(self.N))
+        theta = np.arccos(2 * np.random.random(self.N) - 1)
+        phi = 2 * np.pi * np.random.random(self.N)
         
-        sigma_x = np.sqrt(k * np.mean(self.T) / (Rb87.mass * (self.trap.omega_x**2 + epsilon)))
-        sigma_y = np.sqrt(k * np.mean(self.T) / (Rb87.mass * (self.trap.omega_y**2 + epsilon)))
-        sigma_z = np.sqrt(k * np.mean(self.T) / (Rb87.mass * (self.trap.omega_z**2 + epsilon)))
-        
-        x = np.random.normal(0, sigma_x, self.N)
-        y = np.random.normal(0, sigma_y, self.N)
-        z = np.random.normal(0, sigma_z, self.N)
+        x = r * np.sin(theta) * np.cos(phi)
+        y = r * np.sin(theta) * np.sin(phi)
+        z = r * np.cos(theta)
         
         return np.column_stack((x, y, z))
         
@@ -161,7 +198,11 @@ class AtomCloud:
         if self.positions is None or self.velocities is None:
             logging.error("Positions or velocities are None in update method")
             raise ValueError("Invalid atom cloud state")
+        
         self.positions += self.velocities * dt
+        # Enforce vacuum chamber boundary and update velocities for bounced atoms
+        self.positions, self.velocities = self.vacuum_chamber.enforce_boundary(self.positions, self.velocities)
+        
         self.update_temperature()
         self.check_consistency()
 
@@ -690,9 +731,9 @@ def calculate_scattering_rate(P_p, delta):
     intensity = P_p / beam_area
     s = intensity / Rb87.I_sat
     return Rb87.gamma_D1 / 2 * s / (1 + s + 4 * (delta / Rb87.gamma_D1)**2)
-
+    """
 def calculate_light_shift(P, delta, beam_type='raman'):
-    """Calculate the light shift induced by a beam."""
+    # Calculate the light shift induced by a beam.
     if beam_type == 'raman':
         intensity = calculate_beam_intensity(P, BeamParameters.raman_waist)
     elif beam_type == 'op':
@@ -700,7 +741,7 @@ def calculate_light_shift(P, delta, beam_type='raman'):
     else:
         raise ValueError("Invalid beam type. Use 'raman' or 'op'.")
     return hbar * Rb87.gamma_D1**2 * intensity / (8 * delta * Rb87.I_sat)
-
+    """
 def calculate_beam_intensity(P, wx, wy=None):
     """Calculate the peak intensity of a beam."""
     if wy is None:
@@ -775,7 +816,7 @@ def calculate_festina_lente_factor(atoms, reabsorption_prob, gamma_sc):
 
 
 
-def mot_loading_and_compression_and_gray_molasses(atoms, trap, P_y, P_z, B_z):
+def mot_loading_and_compression_and_gray_molasses(atoms, trap, vacuum_chamber, P_y, P_z, B_z):
     if atoms is None or atoms.N == 0:
         logging.error("Invalid atom cloud passed to MOT loading function")
         raise ValueError("Invalid atom cloud")
@@ -805,6 +846,10 @@ def mot_loading_and_compression_and_gray_molasses(atoms, trap, P_y, P_z, B_z):
     
     B_gradient = 10  # Initial magnetic field gradient (G/cm)
     final_B_gradient = 50  # Final magnetic field gradient (G/cm)
+
+    beam_waist = 0.01  # 1 cm beam waist
+    repump_intensity = 0.1 * Rb87.I_sat_D2  # Repump intensity
+    repump_detuning = 0  # On resonance with F=1 to F'=2 transition
     
     detuning = np.concatenate([
         np.full(int(loading_time/dt), mot_detuning),
@@ -829,15 +874,11 @@ def mot_loading_and_compression_and_gray_molasses(atoms, trap, P_y, P_z, B_z):
     
     # Initialize the MOT with a gas cloud at room temperature
     N_initial = N_atoms_initial  # Initial number of atoms in the gas cloud
-    mot_size = 0.01  # Initial size of the MOT (10 mm diameter)
-    
-    # Generate initial positions and velocities
-    initial_positions = np.random.uniform(-mot_size/2, mot_size/2, (N_initial, 3))
-    sigma_v = np.sqrt(k_B * room_temperature / Rb87.mass)
-    initial_velocities = np.random.normal(0, sigma_v, (N_initial, 3))
-    
+    # In the mot_loading_and_compression_and_gray_molasses function:
+    initial_positions, initial_velocities = generate_initial_positions_and_velocities(N_initial, vacuum_chamber, room_temperature)
+
     # Create initial atom cloud
-    atoms = AtomCloud(N_initial, room_temperature, trap)
+    atoms = AtomCloud(N_initial, room_temperature, trap, vacuum_chamber)
     atoms.positions = initial_positions
     atoms.velocities = initial_velocities
 
@@ -847,19 +888,42 @@ def mot_loading_and_compression_and_gray_molasses(atoms, trap, P_y, P_z, B_z):
     trap_data=[]
 
     try:
+
+        # Use a smaller time step at the beginning
+        initial_dt = dt / 100  # Start with a much smaller time step
+        adaptive_dt = initial_dt
+        max_dt = dt  # Maximum allowed time step
+
+
         # Main simulation loop
         for i, t in enumerate(t_array):
+                # Gradually increase the time step
+            adaptive_dt = min(adaptive_dt * 1.01, max_dt)
+
             # Apply forces
-            if t < loading_time + compression_time:
+            if t < loading_time:
                 cooling_force = calculate_mot_force(atoms.positions, atoms.velocities, 
-                                                    detuning[i], intensity[i], B_grad[i], Rb87.I_sat_D2*0.1, mot_size)
+                                                    detuning[i], intensity[i], B_grad[i],
+                                                    repump_intensity, repump_detuning, beam_waist)
+            elif t < loading_time + compression_time:
+                atoms = compressed_mot_stage(atoms, compression_time, 
+                                            mot_detuning, final_detuning, 
+                                            B_gradient, final_B_gradient,
+                                            mot_intensity, final_intensity,
+                                            repump_intensity, repump_detuning, beam_waist)
+                continue  # Skip the rest of the loop as atoms have been updated in compressed_mot_stage
             else:
                 cooling_force = calculate_gray_molasses_force(atoms.velocities, detuning[i], intensity[i])
             
-            atoms.velocities += cooling_force * dt / Rb87.mass
+            # Ensure cooling_force has the same shape as atoms.velocities
+            if cooling_force.shape != atoms.velocities.shape:
+                logging.warning(f"Shape mismatch: cooling_force {cooling_force.shape}, velocities {atoms.velocities.shape}")
+                cooling_force = cooling_force[:atoms.velocities.shape[0]]
+            
+            atoms.velocities += cooling_force * adaptive_dt / Rb87.mass
             
             # Update positions and temperature
-            atoms.update(dt)
+            atoms.update(adaptive_dt)
             atoms.update_temperature()
             
             # Apply atom losses
@@ -869,8 +933,18 @@ def mot_loading_and_compression_and_gray_molasses(atoms, trap, P_y, P_z, B_z):
                 'light_assisted': calculate_light_assisted_collision_rate(intensity[i], density),
                 'three_body': calculate_three_body_loss_rate(density, np.mean(atoms.T))
             }
-            atoms.apply_losses(loss_rates, dt)
+            atoms.apply_losses(loss_rates, adaptive_dt)
             
+            # Apply temperature limits
+            if t < loading_time + compression_time:
+                T_doppler = -hbar * detuning[i] / (2 * k_B)
+                atoms.T = np.maximum(atoms.T, T_doppler)
+            else:
+                T_sub_doppler = hbar * Rb87.gamma_D1 / (2 * k_B)
+                atoms.T = np.maximum(atoms.T * np.exp(-adaptive_dt / 1e-3), T_sub_doppler)
+
+            atoms.check_consistency()
+
             # Apply temperature limits
             if t < loading_time + compression_time:
                 T_doppler = -hbar * detuning[i] / (2 * k_B)
@@ -879,7 +953,6 @@ def mot_loading_and_compression_and_gray_molasses(atoms, trap, P_y, P_z, B_z):
                 T_sub_doppler = hbar * Rb87.gamma_D1 / (2 * k_B)
                 atoms.T = np.maximum(atoms.T * np.exp(-dt / 1e-3), T_sub_doppler)
 
-            atoms.check_consistency()
 
             # Store atom_data and trap_data
             if i % int(0.001 / dt) == 0:  # Store data every 1 ms
@@ -900,45 +973,88 @@ def mot_loading_and_compression_and_gray_molasses(atoms, trap, P_y, P_z, B_z):
 
     return atoms, atom_data, trap_data
 
-def calculate_mot_force(positions, velocities, detuning, intensity, B_gradient, repump_intensity, beam_waist):
-    # Constants
-    k = 2 * np.pi / Rb87.wavelength_D2  # Wave number
-    gamma = Rb87.gamma_D2  # Natural linewidth
+def calculate_mot_force(positions, velocities, detuning, intensity, B_gradient, repump_intensity, repump_detuning, beam_waist):
+    k = 2 * np.pi / Rb87.wavelength_D2
+    gamma = Rb87.gamma_D2
     
-    # MOT beam directions (for a standard 6-beam MOT)
     beam_directions = np.array([[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]])
     
-    # Calculate magnetic field
-    B = B_gradient * np.sqrt(np.sum(positions**2, axis=1) + 3 * positions[:, 2]**2)
+    B = calculate_magnetic_field(positions, B_gradient)
+    beam_intensity = calculate_beam_intensity(positions, intensity, beam_waist)
     
-    # Calculate beam intensities at atom positions
-    r_squared = np.sum(positions**2, axis=1)
-    beam_intensity = intensity * np.exp(-2 * r_squared / beam_waist**2)
-    
-    # Calculate total saturation parameter (accounting for all beams)
     s0_total = 6 * beam_intensity / Rb87.I_sat_D2
     
-    # Calculate Doppler shifts for all beams
     doppler_shifts = np.dot(velocities, beam_directions.T)
-    
-    # Calculate detunings including Zeeman shift and Doppler shift
     delta = detuning - k * doppler_shifts + Rb87.mu_B * Rb87.g_F * B[:, np.newaxis] / hbar
     
-    # Calculate scattering rates
     R = (gamma / 2) * s0_total[:, np.newaxis] / (1 + s0_total[:, np.newaxis] + 4 * (delta / gamma)**2)
     
-    # Calculate cooling force
     F_cool = -hbar * k * np.sum(R[:, :, np.newaxis] * beam_directions, axis=1)
-    
-    # Calculate trapping force
     F_trap = Rb87.mu_B * Rb87.g_F * B_gradient * np.column_stack((positions[:, 0], positions[:, 1], -2 * positions[:, 2]))
     
-    # Add repump effect
-    repump_factor = repump_intensity / (repump_intensity + Rb87.I_sat_D2)
-    F_total = (F_cool + F_trap) * repump_factor
-
+    repump_rate = calculate_repump_effect(positions, velocities, repump_intensity, repump_detuning)
+    repump_factor = repump_rate / (repump_rate + gamma)
+    
+    logging.debug(f"F_cool shape: {F_cool.shape}, F_trap shape: {F_trap.shape}, repump_factor shape: {repump_factor.shape}")
+    
+    F_total = (F_cool + F_trap) * repump_factor[:, np.newaxis]
+    
+    logging.debug(f"F_total shape: {F_total.shape}")
     
     return F_total
+
+def calculate_magnetic_field(positions, B_gradient):
+    r = np.sqrt(np.sum(positions**2, axis=1))
+    B0 = 1e-4  # Tesla, typical MOT field at the center
+    R0 = 0.01  # meters, characteristic distance for field decay
+    B = B0 + B_gradient * r * np.exp(-r / R0)
+    return B
+
+def calculate_beam_intensity(positions, intensity, beam_waist):
+    r_squared = np.sum(positions**2, axis=1)
+    beam_radius = 5 * beam_waist  # Beam cut-off at 5 times the waist
+    beam_intensity = np.where(r_squared < beam_radius**2,
+                              intensity * np.exp(-2 * r_squared / beam_waist**2),
+                              0)
+    return beam_intensity
+
+def calculate_repump_effect(positions, velocities, repump_intensity, repump_detuning):
+    k_repump = 2 * np.pi / Rb87.wavelength_D1
+    gamma_repump = Rb87.gamma_D1
+    s0_repump = repump_intensity / Rb87.I_sat_D1
+    
+    r_squared = np.sum(positions**2, axis=1)
+    beam_radius = 0.01  # 1 cm radius for repump beam
+    repump_profile = np.where(r_squared < beam_radius**2, 1, 0)
+    
+    doppler_shift = k_repump * velocities[:, 2]  # Assuming repump along z-axis
+    delta_repump = repump_detuning - doppler_shift
+    
+    repump_rate = (gamma_repump / 2) * s0_repump * repump_profile / (1 + s0_repump + 4 * (delta_repump / gamma_repump)**2)
+    
+    return repump_rate.flatten()  # Ensure the output is a 1D array
+
+
+def compressed_mot_stage(atoms, duration, initial_detuning, final_detuning, initial_B_gradient, final_B_gradient, initial_intensity, final_intensity, repump_intensity, repump_detuning, beam_waist):
+    for t in np.arange(0, duration, dt):
+        progress = t / duration
+        current_detuning = initial_detuning + (final_detuning - initial_detuning) * progress
+        current_B_gradient = initial_B_gradient + (final_B_gradient - initial_B_gradient) * progress
+        current_intensity = initial_intensity + (final_intensity - initial_intensity) * progress
+        
+        # Apply compressed MOT forces
+        cooling_force = calculate_mot_force(atoms.positions, atoms.velocities, 
+                                            current_detuning, current_intensity, current_B_gradient, 
+                                            repump_intensity, repump_detuning, beam_waist)
+        atoms.velocities += cooling_force * dt / Rb87.mass
+        
+        atoms.update(dt)
+    
+    return atoms
+
+
+
+
 
 def calculate_gray_molasses_force(velocities, detuning, intensity):
     # Constants
@@ -1025,7 +1141,33 @@ def detect_bec(atoms):
         condensate_fraction = 0
     return condensate_fraction
 
-
+def generate_initial_positions_and_velocities(N_initial, vacuum_chamber, room_temperature):
+    # Generate positions uniformly within a sphere
+    r = vacuum_chamber.radius * np.cbrt(np.random.random(N_initial))
+    theta = np.arccos(2 * np.random.random(N_initial) - 1)
+    phi = 2 * np.pi * np.random.random(N_initial)
+    
+    x = r * np.sin(theta) * np.cos(phi)
+    y = r * np.sin(theta) * np.sin(phi)
+    z = r * np.cos(theta)
+    
+    initial_positions = np.column_stack((x, y, z))
+    
+    # Generate velocities from Maxwell-Boltzmann distribution
+    sigma_v = np.sqrt(k * room_temperature / Rb87.mass)
+    initial_velocities = np.random.normal(0, sigma_v, (N_initial, 3))
+    
+    # Verify that all positions are inside the chamber
+    distances = np.linalg.norm(initial_positions, axis=1)
+    if np.any(distances > vacuum_chamber.radius):
+        logging.warning(f"Found {np.sum(distances > vacuum_chamber.radius)} initial positions outside the chamber. Adjusting...")
+        # Scale positions to ensure they're all inside
+        scale_factor = vacuum_chamber.radius / np.max(distances)
+        initial_positions *= scale_factor
+    
+    logging.info(f"Generated {N_initial} initial positions. Max distance from center: {np.max(np.linalg.norm(initial_positions, axis=1)):.6f} m")
+    
+    return initial_positions, initial_velocities
 
 
 
@@ -1056,7 +1198,11 @@ def run_full_sequence(params):
         initial_P_y, initial_P_z = P_y_interp(0), P_z_interp(0)  # Initial powers in Watts
         trap = TiltedDipleTrap(initial_P_y, initial_P_z, 18e-6, 14e-6, 1064e-9, tilt_angle)
         
-        atoms = AtomCloud(N_atoms_initial, T_initial, trap)
+        
+        # Create spherical vacuum chamber
+        vacuum_chamber = VacuumChamber(radius=0.05)  # 5cm radius chamber
+        
+        atoms = AtomCloud(N_atoms_initial, T_initial, trap, vacuum_chamber)
         
         sigma_minus_beam = LaserBeam(P_p_interp(0), 30e-6, 1e-3, Rb87.wavelength_D1, direction=[0, 0, 1])
         pi_beam = LaserBeam(P_R_interp(0), 0.5e-3, 0.5e-3, Rb87.wavelength_D1, direction=[0, 0, -1])
@@ -1077,7 +1223,7 @@ def run_full_sequence(params):
 
 
         # 1. & 2. MOT loading and compression phase and gray_molasses
-        atoms, atom_data, trap_data = mot_loading_and_compression_and_gray_molasses(atoms, trap, P_y_mot, P_z_mot, B_z_mot)
+        atoms, atom_data, trap_data = mot_loading_and_compression_and_gray_molasses(atoms, trap, vacuum_chamber, P_y_mot, P_z_mot, B_z_mot)
         
        
         # Calculate temperature before cooling
@@ -1533,6 +1679,10 @@ def visualize_atom_cloud(atom_data, trap_data, trap, save_video=False):
     z_min, z_max = float('inf'), float('-inf')
     t_min, t_max = float('inf'), float('-inf')
     
+    x_min, x_max = float(0.5), float(0.5)
+    y_min, y_max = float(0.5), float(0.5)
+    z_min, z_max = float(0.5), float(0.5)
+
     valid_data = False
     for _, positions, temperatures in atom_data:
         if len(positions) > 0 and len(temperatures) > 0:
@@ -1604,15 +1754,15 @@ def visualize_atom_cloud(atom_data, trap_data, trap, save_video=False):
         
         return scatter, potential_surface, title, param_text
     
-    ax.set_xlim(x_min, x_max)
-    ax.set_ylim(y_min, y_max)
-    ax.set_zlim(z_min, z_max)
+    ax.set_xlim(-0.05, 0.05)
+    ax.set_ylim(-0.05, 0.05)
+    ax.set_zlim(-0.05, 0.05)
     ax.set_xlabel('X (m)')
     ax.set_ylabel('Y (m)')
     ax.set_zlabel('Z (m)')
     
-    fig.colorbar(scatter, label='Temperature (K)')
-    scatter.set_clim(t_min, t_max)
+    fig.colorbar(scatter, label='Temperature (μK)')
+    scatter.set_clim(t_min, 50)
     
     anim = FuncAnimation(fig, update, frames=len(atom_data), interval=100, blit=False)
     

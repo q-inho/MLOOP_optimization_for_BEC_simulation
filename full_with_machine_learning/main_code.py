@@ -11,6 +11,8 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from matplotlib.animation import FuncAnimation, writers
+import matplotlib.colors as colors
+from mpl_toolkits.mplot3d.art3d import Line3DCollection
 import logging
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -75,7 +77,9 @@ class BeamParameters:
     op_waist_y = 1e-3             # 1 mm
     
 # Simulation parameters
-N_atoms_initial = int(3.2e5)
+#N_atoms_initial = int(3.2e5)
+
+N_atoms_initial = int(3.2e4)
 T_initial = 300e-6
 dt = 1e-5
 
@@ -723,12 +727,11 @@ def calculate_rabi_frequency(P_R):
     intensity = P_R / beam_area
     return np.sqrt(2 * intensity / (c * epsilon_0 * hbar**2 * Rb87.wavelength_D1**2))
 
-def calculate_scattering_rate(P_p, delta):
-    """Calculate the scattering rate for optical pumping."""
-    beam_area = np.pi * BeamParameters.op_waist_x * BeamParameters.op_waist_y
-    intensity = P_p / beam_area
-    s = intensity / Rb87.I_sat
-    return Rb87.gamma_D1 / 2 * s / (1 + s + 4 * (delta / Rb87.gamma_D1)**2)
+def calculate_scattering_rate(intensity, detuning):
+    # Calculate the photon scattering rate
+    s = intensity / Rb87.I_sat_D1  # Use D1 line for gray molasses
+    gamma = Rb87.gamma_D1
+    return 0.5 * gamma * s / (1 + s + 4 * (detuning/gamma)**2)
     """
 def calculate_light_shift(P, delta, beam_type='raman'):
     # Calculate the light shift induced by a beam.
@@ -845,31 +848,35 @@ def mot_loading_and_compression_and_gray_molasses(atoms, trap, vacuum_chamber, P
     B_gradient = 10  # Initial magnetic field gradient (G/cm)
     final_B_gradient = 50  # Final magnetic field gradient (G/cm)
 
-    beam_waist = 0.01  # 1 cm beam waist
+    beam_waist = 0.0008  # 1 cm beam waist
     repump_intensity = 0.1 * Rb87.I_sat_D2  # Repump intensity
     repump_detuning = 0  # On resonance with F=1 to F'=2 transition
+
+    # Smooth parameter ramping functions
+    def smooth_ramp(start, end, t, duration):
+        progress = t / duration
+        return start + (end - start) * (3 * progress**2 - 2 * progress**3)
     
-    detuning = np.concatenate([
-        np.full(int(loading_time/dt), mot_detuning),
-        np.linspace(mot_detuning, final_detuning, int(compression_time/dt)),
-        np.full(int(gray_molasses_time/dt), gray_molasses_detuning)
-    ])
-    intensity = np.concatenate([
-        np.full(int(loading_time/dt), mot_intensity),
-        np.linspace(mot_intensity, final_intensity, int(compression_time/dt)),
-        np.full(int(gray_molasses_time/dt), gray_molasses_intensity)
-    ])
-    B_grad = np.concatenate([
-        np.full(int(loading_time/dt), B_gradient),
-        np.linspace(B_gradient, final_B_gradient, int(compression_time/dt)),
-        np.full(int(gray_molasses_time/dt), final_B_gradient)
+    
+    detuning = np.array([
+        mot_detuning if t < loading_time else
+        smooth_ramp(mot_detuning, final_detuning, t - loading_time, compression_time) if t < loading_time + compression_time else
+        gray_molasses_detuning
+        for t in t_array
     ])
     
-    # Ensure arrays have the correct length
-    detuning = np.resize(detuning, num_steps)
-    intensity = np.resize(intensity, num_steps)
-    B_grad = np.resize(B_grad, num_steps)
+    intensity = np.array([
+        mot_intensity if t < loading_time else
+        smooth_ramp(mot_intensity, final_intensity, t - loading_time, compression_time) if t < loading_time + compression_time else
+        gray_molasses_intensity
+        for t in t_array
+    ])
     
+    B_grad = np.array([
+        smooth_ramp(B_gradient, final_B_gradient, t, total_time)
+        for t in t_array
+    ])
+
     # Initialize the MOT with a gas cloud at room temperature
     N_initial = N_atoms_initial  # Initial number of atoms in the gas cloud
     # In the mot_loading_and_compression_and_gray_molasses function:
@@ -882,34 +889,27 @@ def mot_loading_and_compression_and_gray_molasses(atoms, trap, vacuum_chamber, P
 
     logging.info(f"Starting MOT loading and compression with {atoms.N} atoms at {np.mean(atoms.T)*1e6:.2f} μK")
 
-    atom_data=[]
-    trap_data=[]
+    atom_data = []
+    trap_data = []
 
     try:
-
-        # Use a smaller time step at the beginning
-        initial_dt = dt / 100  # Start with a much smaller time step
-        adaptive_dt = initial_dt
-        max_dt = dt  # Maximum allowed time step
-
-
         # Main simulation loop
         for i, t in enumerate(t_array):
-                # Gradually increase the time step
-            adaptive_dt = min(adaptive_dt * 1.01, max_dt)
-
             # Apply forces
             if t < loading_time:
                 cooling_force = calculate_mot_force(atoms.positions, atoms.velocities, 
                                                     detuning[i], intensity[i], B_grad[i],
                                                     repump_intensity, repump_detuning, beam_waist)
             elif t < loading_time + compression_time:
-                atoms = compressed_mot_stage(atoms, compression_time, 
-                                            mot_detuning, final_detuning, 
-                                            B_gradient, final_B_gradient,
-                                            mot_intensity, final_intensity,
-                                            repump_intensity, repump_detuning, beam_waist)
-                continue  # Skip the rest of the loop as atoms have been updated in compressed_mot_stage
+                compression_progress = (t - loading_time) / compression_time
+                if compression_progress < 0.8:  # Use 80% of compression time for R&R
+                    # Release and retrap compression
+                    atoms = release_and_retrap_compression(atoms, trap, duration=compression_time, t=t-loading_time)
+                else:
+                    # Final compression and cooling
+                    cooling_force = calculate_mot_force(atoms.positions, atoms.velocities, 
+                                                        detuning[i], intensity[i], B_grad[i],
+                                                        repump_intensity, repump_detuning, beam_waist)
             else:
                 cooling_force = calculate_gray_molasses_force(atoms.velocities, detuning[i], intensity[i])
             
@@ -918,10 +918,15 @@ def mot_loading_and_compression_and_gray_molasses(atoms, trap, vacuum_chamber, P
                 logging.warning(f"Shape mismatch: cooling_force {cooling_force.shape}, velocities {atoms.velocities.shape}")
                 cooling_force = cooling_force[:atoms.velocities.shape[0]]
             
-            atoms.velocities += cooling_force * adaptive_dt / Rb87.mass
+            atoms.velocities += cooling_force * dt / Rb87.mass
+            
+            # Update velocities and positions using Velocity Verlet algorithm
+            atoms.velocities += 0.5 * cooling_force * dt / Rb87.mass
+            atoms.positions += atoms.velocities * dt
+            atoms.velocities += 0.5 * cooling_force * dt / Rb87.mass
             
             # Update positions and temperature
-            atoms.update(adaptive_dt)
+            atoms.update(dt)
             atoms.update_temperature()
             
             # Apply atom losses
@@ -931,18 +936,40 @@ def mot_loading_and_compression_and_gray_molasses(atoms, trap, vacuum_chamber, P
                 'light_assisted': calculate_light_assisted_collision_rate(intensity[i], density),
                 'three_body': calculate_three_body_loss_rate(density, np.mean(atoms.T))
             }
-            atoms.apply_losses(loss_rates, adaptive_dt)
+            atoms.apply_losses(loss_rates, dt)
             
-            # Apply temperature limits
-            if t < loading_time + compression_time:
-                T_doppler = -hbar * detuning[i] / (2 * k_B)
-                atoms.T = np.maximum(atoms.T, T_doppler)
+            # Apply additional cooling and heating effects
+            if t < loading_time:
+                # MOT loading - Doppler cooling
+                v_doppler = np.sqrt(hbar * Rb87.gamma_D2 / Rb87.mass)
+                atoms.velocities *= np.exp(-0.1 * dt)  # Simple velocity damping
+                atoms.velocities += np.random.normal(0, v_doppler/np.sqrt(3), atoms.velocities.shape) * np.sqrt(dt)
+            elif t < loading_time + compression_time:
+                # Compressed MOT - Enhanced cooling with density-dependent heating
+                v_doppler = np.sqrt(hbar * Rb87.gamma_D2 / Rb87.mass)
+                compression_factor = 1 - (t - loading_time) / compression_time
+                atoms.velocities *= np.exp(-0.2 * dt)  # Enhanced velocity damping
+                atoms.velocities += np.random.normal(0, compression_factor * v_doppler/np.sqrt(3), atoms.velocities.shape) * np.sqrt(dt)
+                
+                # Density-dependent heating
+                heating_velocity = np.sqrt(1e-3 * density / 1e12 * dt)  # Adjust factor based on experimental data
+                atoms.velocities += np.random.normal(0, heating_velocity, atoms.velocities.shape)
             else:
-                T_sub_doppler = hbar * Rb87.gamma_D1 / (2 * k_B)
-                atoms.T = np.maximum(atoms.T * np.exp(-adaptive_dt / 1e-3), T_sub_doppler)
-
-            atoms.check_consistency()
-
+                # Gray molasses - Sub-Doppler cooling
+                v_recoil = hbar * 2 * np.pi / (Rb87.wavelength_D1 * Rb87.mass)
+                scattering_rate = calculate_scattering_rate(intensity[i], detuning[i])
+                cooling_rate = 1e-1 * np.exp(-scattering_rate / 1e5)  # Adjust based on experimental data
+                atoms.velocities *= np.exp(-cooling_rate * dt)
+                
+                # Ensure velocities don't go below half recoil velocity (allowing for sub-recoil temperatures)
+                velocity_magnitudes = np.linalg.norm(atoms.velocities, axis=1)
+                if np.any(velocity_magnitudes > 0):
+                    min_velocity = v_recoil / 2
+                    scale_factors = np.maximum(velocity_magnitudes, min_velocity) / np.maximum(velocity_magnitudes, 1e-10)
+                    atoms.velocities *= scale_factors[:, np.newaxis]
+            
+            atoms.update_temperature()
+            
             # Store atom_data and trap_data
             if i % int(0.001 / dt) == 0:  # Store data every 1 ms
                 atom_data.append((t, atoms.positions.copy(), atoms.T.copy()))
@@ -961,6 +988,7 @@ def mot_loading_and_compression_and_gray_molasses(atoms, trap, vacuum_chamber, P
     logging.info(f"MOT and gray molasses complete. Final atoms: {atoms.N}, Final temperature: {final_temp*1e6:.2f} μK")
 
     return atoms, atom_data, trap_data
+
 
 def calculate_mot_force(positions, velocities, detuning, intensity, B_gradient, repump_intensity, repump_detuning, beam_waist):
     k = 2 * np.pi / Rb87.wavelength_D2
@@ -1024,21 +1052,63 @@ def calculate_repump_effect(positions, velocities, repump_intensity, repump_detu
     return repump_rate.flatten()  # Ensure the output is a 1D array
 
 
-def compressed_mot_stage(atoms, duration, initial_detuning, final_detuning, initial_B_gradient, final_B_gradient, initial_intensity, final_intensity, repump_intensity, repump_detuning, beam_waist):
-    for t in np.arange(0, duration, dt):
-        progress = t / duration
-        current_detuning = initial_detuning + (final_detuning - initial_detuning) * progress
-        current_B_gradient = initial_B_gradient + (final_B_gradient - initial_B_gradient) * progress
-        current_intensity = initial_intensity + (final_intensity - initial_intensity) * progress
-        
-        # Apply compressed MOT forces
-        cooling_force = calculate_mot_force(atoms.positions, atoms.velocities, 
-                                            current_detuning, current_intensity, current_B_gradient, 
-                                            repump_intensity, repump_detuning, beam_waist)
-        atoms.velocities += cooling_force * dt / Rb87.mass
-        
-        atoms.update(dt)
+def release_and_retrap_compression(atoms, trap, duration, t):
+    # Implement the release and retrap compression technique
+    # Step 1: Perform initial dRSC
+    atoms = perform_drsc(atoms, duration=0.2*duration)
     
+    # Step 2: Compress along y
+    original_P_y = trap.P_y
+    trap.update_powers(P_y=0, P_z=trap.P_z)  # Turn off Y beam
+    atoms = compress_along_axis(atoms, axis='y', duration=0.2*duration)
+    
+    # Step 3: Switch back to 2D lattice and thermalize
+    trap.update_powers(P_y=original_P_y, P_z=trap.P_z)
+    atoms.update(0.1*duration)  # Thermalization time
+    
+    # Step 4: Compress along x
+    original_P_z = trap.P_z
+    trap.update_powers(P_y=trap.P_y, P_z=0)  # Turn off Z beam
+    atoms = compress_along_axis(atoms, axis='x', duration=0.2*duration)
+    trap.update_powers(P_y=trap.P_y, P_z=original_P_z)
+    atoms.update(0.1*duration)  # Thermalization time
+    
+    # Step 5: Final dRSC
+    atoms = perform_drsc(atoms, duration=0.2*duration)
+    
+    return atoms
+
+def perform_drsc(atoms, duration):
+    # Implement degenerate Raman sideband cooling
+    cooling_rate = 1e-1  # Adjust based on experimental data
+    for _ in range(int(duration / dt)):
+        cooling_force = -cooling_rate * atoms.velocities
+        atoms.velocities += cooling_force * dt
+        atoms.update(dt)
+    atoms.update_temperature()
+    return atoms
+
+
+def compress_along_axis(atoms, axis, duration):
+    if axis == 'y':
+        compression_factor = 0.5  # Adjust based on experimental parameters
+        atoms.positions[:, 1] *= compression_factor
+        atoms.velocities[:, 1] /= compression_factor  # Conservation of momentum
+    elif axis == 'x':
+        compression_factor = 0.5  # Adjust based on experimental parameters
+        atoms.positions[:, 0] *= compression_factor
+        atoms.velocities[:, 0] /= compression_factor  # Conservation of momentum
+    
+    # Simulate some heating due to compression
+    current_temperature = atoms.calculate_temperature()
+    heating_factor = 1 / compression_factor
+    new_temperature = current_temperature * heating_factor
+    
+    velocity_std = np.sqrt(k * new_temperature / Rb87.mass)
+    heating_velocities = np.random.normal(0, velocity_std, atoms.velocities.shape)
+    atoms.velocities += heating_velocities
+    
+    atoms.update_temperature()
     return atoms
 
 
@@ -1667,10 +1737,6 @@ def visualize_atom_cloud(atom_data, trap_data, trap, save_video=False):
     y_min, y_max = float('inf'), float('-inf')
     z_min, z_max = float('inf'), float('-inf')
     t_min, t_max = float('inf'), float('-inf')
-    
-    x_min, x_max = float(0.5), float(0.5)
-    y_min, y_max = float(0.5), float(0.5)
-    z_min, z_max = float(0.5), float(0.5)
 
     valid_data = False
     for _, positions, temperatures in atom_data:
@@ -1716,12 +1782,41 @@ def visualize_atom_cloud(atom_data, trap_data, trap, save_video=False):
     potential_surface = ax.plot_surface(X, Y, Z, cmap='viridis', alpha=0.1)
     title = ax.set_title('')
     param_text = ax.text2D(0.05, 0.95, '', transform=ax.transAxes)
+
+    # Generate MOT beams
+    mot_beam_radius = 0.008  # 8 mm radius
+    mot_beam_length = 0.1    # 10 cm length
+    mot_beams = [
+        generate_laser_beam([-mot_beam_length/2, 0, 0], [1, 0, 0], mot_beam_length, mot_beam_radius),
+        generate_laser_beam([mot_beam_length/2, 0, 0], [-1, 0, 0], mot_beam_length, mot_beam_radius),
+        generate_laser_beam([0, -mot_beam_length/2, 0], [0, 1, 0], mot_beam_length, mot_beam_radius),
+        generate_laser_beam([0, mot_beam_length/2, 0], [0, -1, 0], mot_beam_length, mot_beam_radius),
+        generate_laser_beam([0, 0, -mot_beam_length/2], [0, 0, 1], mot_beam_length, mot_beam_radius),
+        generate_laser_beam([0, 0, mot_beam_length/2], [0, 0, -1], mot_beam_length, mot_beam_radius)
+    ]
+    
+    # Generate gray molasses beams (assuming same geometry as MOT beams)
+    molasses_beams = mot_beams.copy()
+    
+    # Create colormaps for laser beams
+    cmap_mot = plt.get_cmap('Reds')
+    cmap_molasses = plt.get_cmap('Blues')
+    
+    mot_beam_surfaces = [ax.plot_surface(*beam, color='red', alpha=0.1) for beam in mot_beams]
+    molasses_beam_surfaces = [ax.plot_surface(*beam, color='blue', alpha=0.1) for beam in molasses_beams]
+    
+    # Add scale bar
+    scale_bar_length = 10e-3  # 10 mm
+    scale_bar = Line3DCollection([([-0.04, -0.04, -0.04], [-0.04 + scale_bar_length, -0.04, -0.04])],
+                                 colors='white', linewidths=2)
+    ax.add_collection3d(scale_bar)
+    ax.text(-0.04, -0.045, -0.04, f"{scale_bar_length*1e3:.0f} mm", color='white')
+
     
     def update(frame):
-        nonlocal potential_surface
         if frame < len(atom_data):
             t, positions, temperatures = atom_data[frame]
-            _, P_y, P_z, B_z = trap_data[frame] if frame < len(trap_data) else (0, 0, 0, 0)
+            _, _, _, B_z = trap_data[frame] if frame < len(trap_data) else (0, 0, 0, 0)
             
             if len(positions) > 0 and len(temperatures) > 0:
                 scatter._offsets3d = (positions[:, 0], positions[:, 1], positions[:, 2])
@@ -1730,30 +1825,39 @@ def visualize_atom_cloud(atom_data, trap_data, trap, save_video=False):
                 scatter._offsets3d = ([], [], [])
                 scatter.set_array([])
             
-            # Update Z values for the potential surface
-            for i in range(X.shape[0]):
-                for j in range(X.shape[1]):
-                    Z[i, j] = trap.get_potential(X[i, j], Y[i, j], 0)  # Use z=0 for simplicity
+            # Update beam intensities based on the stage
+            mot_intensity = 1.0 if t < 0.089 else 0.1 if t < 0.099 else 0.0
+            molasses_intensity = 1.0 if 0.099 <= t < 0.1 else 0.0
             
-            potential_surface.remove()
-            potential_surface = ax.plot_surface(X, Y, Z, cmap='viridis', alpha=0.1)
+            for beam_surface in mot_beam_surfaces:
+                beam_surface.set_alpha(0.1 * mot_intensity)
+            for beam_surface in molasses_beam_surfaces:
+                beam_surface.set_alpha(0.1 * molasses_intensity)
             
             title.set_text(f'Atom Cloud at t = {t:.3f} s')
-            param_text.set_text(f'P_y = {P_y:.2f} W\nP_z = {P_z:.2f} W\nB_z = {B_z:.2f} G')
+            stage = "MOT Loading" if t < 0.089 else "MOT Compression" if t < 0.099 else "Gray Molasses" if t < 0.1 else "Cooling Complete"
+            param_text.set_text(f'Stage: {stage}\nB_z = {B_z:.2f} G')
         
-        return scatter, potential_surface, title, param_text
+        return (scatter, title, param_text) + tuple(mot_beam_surfaces) + tuple(molasses_beam_surfaces)
     
-    ax.set_xlim(x_min, x_max)
-    ax.set_ylim(y_min, y_max)
-    ax.set_zlim(z_min, z_max)
+
+    ax.set_xlim(-0.05, 0.05)
+    ax.set_ylim(-0.05, 0.05)
+    ax.set_zlim(-0.05, 0.05)
     ax.set_xlabel('X (m)')
     ax.set_ylabel('Y (m)')
     ax.set_zlabel('Z (m)')
     
-    fig.colorbar(scatter, label='Temperature (K)')
-    scatter.set_clim(t_min, t_max)
+    fig.colorbar(scatter, label='Temperature (μK)')
+    scatter.set_clim(t_min, 50)
     
-    anim = FuncAnimation(fig, update, frames=len(atom_data), interval=100, blit=False)
+    # Add legend for laser beams
+    ax.plot([], [], [], color='red', label='MOT Beams')
+    ax.plot([], [], [], color='blue', label='Gray Molasses Beams')
+    ax.legend()
+    
+    anim = FuncAnimation(fig, update, frames=len(atom_data), interval=50, blit=False)
+    
     
     if save_video:
         Writer = writers['ffmpeg']
@@ -1761,6 +1865,17 @@ def visualize_atom_cloud(atom_data, trap_data, trap, save_video=False):
         anim.save('bec_simulation.mp4', writer=writer)
     
     plt.show()
+
+def generate_laser_beam(origin, direction, length, radius, n_points=100, n_theta=20):
+    t = np.linspace(0, length, n_points)
+    theta = np.linspace(0, 2*np.pi, n_theta)
+    t, theta = np.meshgrid(t, theta)
+    
+    x = origin[0] + direction[0]*t + radius * np.cos(theta) * direction[1]
+    y = origin[1] + direction[1]*t + radius * np.sin(theta) * direction[0]
+    z = origin[2] + direction[2]*t
+    
+    return x, y, z
                   
                    
 # Make sure the validate_simulation function is defined as follows:
