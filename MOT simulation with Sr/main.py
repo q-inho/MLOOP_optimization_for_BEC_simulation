@@ -52,6 +52,37 @@ def set_simulation_parameters(delta, S, gradient):
         'gamma_prime': gamma * np.sqrt(1 + S)
     }
 
+def setup_laser_beams():
+    """
+    Set up the laser beam configuration with proper polarizations and directions.
+    
+    Returns:
+    tuple: (k_vectors, polarizations)
+    """
+    # Define the k-vectors for the six beams
+    k_vectors = np.array([
+        [1, 0, 0], [-1, 0, 0],  # x-axis beams
+        [0, 1, 0], [0, -1, 0],  # y-axis beams
+        [0, 0, 1], [0, 0, -1]   # z-axis beams
+    ])
+    
+    # Define the polarization vectors for each beam
+    polarizations = np.zeros((6, 3, 3), dtype=complex)
+    
+    # x-axis beams
+    polarizations[0] = np.array([[0, 1, 1j], [1, 0, 0], [1j, 0, 0]]) / np.sqrt(2)
+    polarizations[1] = np.array([[0, 1, -1j], [1, 0, 0], [-1j, 0, 0]]) / np.sqrt(2)
+    
+    # y-axis beams
+    polarizations[2] = np.array([[1, 0, 1j], [0, 1, 0], [1j, 0, 0]]) / np.sqrt(2)
+    polarizations[3] = np.array([[1, 0, -1j], [0, 1, 0], [-1j, 0, 0]]) / np.sqrt(2)
+    
+    # z-axis beams
+    polarizations[4] = np.array([[1, 1j, 0], [1j, -1, 0], [0, 0, 1]]) / np.sqrt(2)
+    polarizations[5] = np.array([[1, -1j, 0], [-1j, -1, 0], [0, 0, 1]]) / np.sqrt(2)
+    
+    return k_vectors, polarizations
+
 def calculate_magnetic_field(positions, gradient):
     """
     Calculate the quadrupole magnetic field at given positions.
@@ -111,17 +142,6 @@ def calculate_cloud_properties(positions, velocities):
     }
 
 def calculate_coupling_strength(B_local, k_vectors, polarizations):
-    """
-    Calculate the coupling strength for each atom and laser beam, considering all Zeeman sublevels.
-    
-    Args:
-    B_local (array): Nx3 array of local magnetic field vectors for N atoms
-    k_vectors (array): 6x3 array of laser beam directions
-    polarizations (array): 6x3x3 array of polarization vectors (ε+, ε0, ε-)
-    
-    Returns:
-    array: Nx6x3 array of coupling strengths W for each atom, laser beam, and Zeeman sublevel
-    """
     N = len(B_local)
     W = np.zeros((N, len(k_vectors), 3))
     
@@ -147,7 +167,7 @@ def calculate_coupling_strength(B_local, k_vectors, polarizations):
     
     return W
 
-def calculate_force(positions, velocities, params, k_vectors, zeeman_splitting):
+def calculate_force(positions, velocities, params, k_vectors, zeeman_splitting, W):
     force = np.zeros_like(positions)
     
     for i, k in enumerate(k_vectors):
@@ -155,7 +175,7 @@ def calculate_force(positions, velocities, params, k_vectors, zeeman_splitting):
         detuning = params['delta'] - doppler_shift[:, np.newaxis] - zeeman_splitting[:, np.newaxis] * np.array([-1, 0, 1])
         
         gamma_prime = gamma * np.sqrt(1 + params['S'])
-        scattering_rate = 0.5 * gamma * params['S'] / (1 + params['S'] + 4 * (detuning / gamma_prime)**2)
+        scattering_rate = 0.5 * gamma * params['S'] * W[:, i, :] / (1 + params['S'] + 4 * (detuning / gamma_prime)**2)
         
         force += hbar * k_light * np.sum(scattering_rate, axis=1)[:, np.newaxis] * k
     
@@ -283,14 +303,7 @@ def run_simulation(num_atoms, total_time, initial_size, initial_temperature, del
     positions, velocities = initialize_atoms(num_atoms, initial_size, initial_temperature)
     params = set_simulation_parameters(delta, S, gradient)
     
-    k_vectors = np.array([
-        [1, 0, 0], [-1, 0, 0],
-        [0, 1, 0], [0, -1, 0],
-        [0, 0, 1], [0, 0, -1]
-    ])
-    
-    polarizations = calculate_laser_polarization(k_vectors)
-    zeeman_splitting = calculate_zeeman_splitting(positions, gradient)
+    k_vectors, polarizations = setup_laser_beams()
     
     history = []
     
@@ -304,7 +317,7 @@ def run_simulation(num_atoms, total_time, initial_size, initial_temperature, del
         W = calculate_coupling_strength(B_local, k_vectors, polarizations)
         
         # Calculate forces
-        forces = calculate_force(positions, velocities, params, k_vectors, zeeman_splitting)
+        forces = calculate_force(positions, velocities, params, k_vectors, zeeman_splitting, W)
         
         # Calculate scattering probabilities
         P = calculate_scattering_probability(params['delta'], params['S'], gamma, zeeman_splitting, velocities, k_vectors, W, dt)
@@ -322,11 +335,10 @@ def run_simulation(num_atoms, total_time, initial_size, initial_temperature, del
         # Update velocities due to gravity
         velocities += np.array([0, 0, -g]) * dt
         
-        if step % 10 == 0:  # Store history every 10 steps
+        if step % 10 == 0:  # Store history more frequently
             history.append((positions.copy(), velocities.copy()))
     
-    return history, determine_regime(S, delta, gamma)
-
+    return history
 
 def run_specific_simulation(delta, S, gradient, num_atoms=5000, total_time=15e-3):
     params = set_simulation_parameters(delta, S, gradient)
@@ -450,20 +462,19 @@ def plot_force_curve(ax, params, title, extra_S=None):
     positions[:, 2] = z  # Set z-coordinates
     velocities = np.zeros_like(positions)  # Assume zero velocity
     
-    k_vectors = np.array([
-        [0, 0, 1],
-        [0, 0, -1]
-    ])  # Only consider vertical beams for simplicity
+    k_vectors, polarizations = setup_laser_beams()
     
     zeeman_splitting = calculate_zeeman_splitting(positions, params['gradient'])
+    B_local = calculate_magnetic_field(positions, params['gradient'])
+    W = calculate_coupling_strength(B_local, k_vectors, polarizations)
     
-    force = calculate_force(positions, velocities, params, k_vectors, zeeman_splitting)
+    force = calculate_force(positions, velocities, params, k_vectors, zeeman_splitting, W)
     ax.plot(force[:, 2] * 1e23, z * 1e6, 'r-', label=f'S = {params["S"]}')
     
     if extra_S is not None:
         extra_params = params.copy()
         extra_params['S'] = extra_S
-        extra_force = calculate_force(positions, velocities, extra_params, k_vectors, zeeman_splitting)
+        extra_force = calculate_force(positions, velocities, extra_params, k_vectors, zeeman_splitting, W)
         ax.plot(extra_force[:, 2] * 1e23, z * 1e6, 'b-', label=f'S = {extra_S}')
     
     ax.set_xlabel('Force/10^-23 (N)')
