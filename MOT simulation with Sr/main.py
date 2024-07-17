@@ -167,30 +167,41 @@ def calculate_coupling_strength(B_local, k_vectors, polarizations):
     
     return W
 
-def calculate_force(positions, velocities, params, k_vectors, zeeman_splitting, W):
-    force = np.zeros_like(positions)
+def calculate_force(z, params, k_vectors):
+    """
+    Calculate the force on an atom at position z.
     
-    for i, k in enumerate(k_vectors):
-        doppler_shift = np.sum(velocities * k, axis=1)
-        detuning = params['delta'] - doppler_shift[:, np.newaxis] - zeeman_splitting[:, np.newaxis] * np.array([-1, 0, 1])
-        
-        gamma_prime = gamma * np.sqrt(1 + params['S'])
-        scattering_rate = 0.5 * gamma * params['S'] * W[:, i, :] / (1 + params['S'] + 4 * (detuning / gamma_prime)**2)
-        
-        force += hbar * k_light * np.sum(scattering_rate, axis=1)[:, np.newaxis] * k
+    Args:
+    z (float): z-position of the atom
+    params (dict): Parameters including delta, S, gradient
+    k_vectors (array): Array of laser beam directions
     
-    return force
+    Returns:
+    float: Force on the atom
+    """
+    B = params['gradient'] * abs(z)  # Magnetic field
+    delta_omega_z = g_factor * mu_B * B / hbar  # Zeeman shift
+    
+    # Calculate detuning for σ+ and σ- transitions
+    detuning_plus = params['delta'] - delta_omega_z
+    detuning_minus = params['delta'] + delta_omega_z
+    
+    # Calculate force contributions from σ+ and σ- beams
+    force_plus = calculate_beam_force(detuning_plus, params['S'])
+    force_minus = -calculate_beam_force(detuning_minus, params['S'])  # Negative because beam direction is opposite
+    
+    return force_plus + force_minus
 
 def calculate_beam_force(detuning, S):
     """
     Calculate the force from a single beam.
     
     Args:
-    detuning (array): Effective detuning at each position
+    detuning (float): Effective detuning
     S (float): Saturation parameter
     
     Returns:
-    array: Force from this beam at each position
+    float: Force from this beam
     """
     gamma_prime = gamma * np.sqrt(1 + S)
     scattering_rate = 0.5 * gamma * S / (1 + S + 4 * (detuning / gamma_prime)**2)
@@ -444,7 +455,7 @@ def plot_figure1(history1, history2, params1, params2, regime1, regime2):
         resonance = np.abs(delta_omega_z) == np.abs(params['delta'])
         ax.contour(X*1e6, Z*1e6, resonance, colors='r', linestyles='dashed', levels=[0.5])
     
-    # Plot force curves (keep this part unchanged)
+    # Plot force curves
     plot_force_curve(axs[0, 1], params1, '(b)')
     plot_force_curve(axs[1, 1], params2, '(d)', extra_S=1)
     
@@ -454,29 +465,21 @@ def plot_figure1(history1, history2, params1, params2, regime1, regime2):
     
     plt.tight_layout()
     plt.show()
-    
+
 
 
 def plot_force_curve(ax, params, title, extra_S=None):
     z = np.linspace(-300e-6, 300e-6, 1000)
-    positions = np.zeros((len(z), 3))
-    positions[:, 2] = z  # Set z-coordinates
-    velocities = np.zeros_like(positions)  # Assume zero velocity
+    k_vectors = np.array([[0, 0, 1], [0, 0, -1]])  # Only vertical beams for simplicity
     
-    k_vectors, polarizations = setup_laser_beams()
-    
-    zeeman_splitting = calculate_zeeman_splitting(positions, params['gradient'])
-    B_local = calculate_magnetic_field(positions, params['gradient'])
-    W = calculate_coupling_strength(B_local, k_vectors, polarizations)
-    
-    force = calculate_force(positions, velocities, params, k_vectors, zeeman_splitting, W)
-    ax.plot(force[:, 2] * 1e23, z * 1e6, 'r-', label=f'S = {params["S"]}')
+    force = np.array([calculate_force(zi, params, k_vectors) for zi in z])
+    ax.plot(force * 1e23, z * 1e6, 'r-', label=f'S = {params["S"]}')
     
     if extra_S is not None:
         extra_params = params.copy()
         extra_params['S'] = extra_S
-        extra_force = calculate_force(positions, velocities, extra_params, k_vectors, zeeman_splitting, W)
-        ax.plot(extra_force[:, 2] * 1e23, z * 1e6, 'b-', label=f'S = {extra_S}')
+        extra_force = np.array([calculate_force(zi, extra_params, k_vectors) for zi in z])
+        ax.plot(extra_force * 1e23, z * 1e6, 'b-', label=f'S = {extra_S}')
     
     ax.set_xlabel('Force/10^-23 (N)')
     ax.set_ylabel('z (μm)')
@@ -561,13 +564,6 @@ params1 = set_simulation_parameters(delta1, S1, gradient)
 S2, delta2 = 20, -2 * np.pi * 200e3
 history2, regime2 = run_simulation(num_atoms, total_time, initial_size, initial_temperature, delta2, S2, gradient)
 params2 = set_simulation_parameters(delta2, S2, gradient)
-
-
-
-
-print(f"Regime for Case 1: {regime1}")
-print(f"Regime for Case 2: {regime2}")
-
 
 # Plot Figure 1
 plot_figure1(history1, history2, params1, params2, regime1, regime2)
