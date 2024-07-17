@@ -572,6 +572,3 @@ print(f"Regime for Case 2: {regime2}")
 # Plot Figure 1
 plot_figure1(history1, history2, params1, params2, regime1, regime2)
 
-# Call this function for both cases
-plot_scattering_rate(params1, regime1)
-plot_scattering_rate(params2, regime2)
