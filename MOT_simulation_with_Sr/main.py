@@ -3,6 +3,9 @@ import matplotlib.pyplot as plt
 from scipy.constants import h, hbar, mu_0, c, elementary_charge as e, k as kB
 from scipy import stats
 from scipy.optimize import curve_fit
+import matplotlib
+matplotlib.use('Agg')  # Use the 'Agg' backend, which doesn't require a GUI
+
 
 # Constants for ^88Sr 5s^2 ^1S_0 → 5s5p ^3P_1 transition
 m = 87.62 * 1.66e-27  # mass of Sr-88 in kg
@@ -15,7 +18,7 @@ mu_B = 9.274e-24  # Bohr magneton
 g_factor = 1.5  # Landé g-factor for 3P1 state
 
 # Simulation parameters
-N_atoms = 10  # number of atoms
+N_atoms = 100  # number of atoms
 dt = 0.1 / gamma  # time step
 t_total = 15e-3  # total simulation time
 steps = int(t_total / dt)
@@ -335,9 +338,8 @@ def run_simulation_for_image(Delta, S, simulation_time):
     
     return positions
 
-def plot_figure_1():
-    fig, axs = plt.subplots(2, 2, figsize=(10, 10))
-    
+
+def plot_figure_1(save_prefix='nmot_plot', reduced_complexity=True):
     for scenario in range(2):
         try:
             if scenario == 0:
@@ -353,62 +355,49 @@ def plot_figure_1():
             image = create_absorption_image(positions)
             print(f"Absorption image created. Shape: {image.shape}, min={image.min()}, max={image.max()}")
             
+            # Save raw image data
+            raw_image_file = f'{save_prefix}_raw_absorption_S{S}.npy'
+            print(f"Saving raw absorption image data to {raw_image_file}")
+            np.save(raw_image_file, image)
+            print("Raw absorption image data saved")
+            
+            # Attempt to create a simple plot of the image
+            try:
+                fig, ax = plt.subplots(figsize=(5, 5))
+                ax.imshow(image, cmap='Blues', origin='lower')
+                ax.set_title(f'Absorption Image (S = {S})')
+                plt.tight_layout()
+                simple_image_file = f'{save_prefix}_simple_absorption_S{S}.png'
+                print(f"Saving simple absorption image to {simple_image_file}")
+                plt.savefig(simple_image_file, dpi=100)
+                plt.close(fig)
+                print("Simple absorption image saved")
+            except Exception as e:
+                print(f"Error saving simple absorption image: {str(e)}")
+                import traceback
+                traceback.print_exc()
+            
             print("Creating force curve...")
             z, force = create_force_curve((-200e-6, 200e-6), Delta, S)
             print(f"Force curve created. z shape: {z.shape}, force shape: {force.shape}")
-            print(f"z stats: min={z.min()}, max={z.max()}, mean={z.mean()}")
-            print(f"force stats: min={force.min()}, max={force.max()}, mean={force.mean()}")
             
-            # Plot absorption image
-            extent = [positions[:, 0].min()*1e6, positions[:, 0].max()*1e6, 
-                      positions[:, 2].min()*1e6, positions[:, 2].max()*1e6]
-            print(f"Plotting absorption image for scenario {scenario+1}")
-            axs[scenario, 0].imshow(image, extent=extent, aspect='equal', cmap='Blues', origin='lower')
+            # Save raw force curve data
+            raw_force_file = f'{save_prefix}_raw_force_S{S}.npz'
+            print(f"Saving raw force curve data to {raw_force_file}")
+            np.savez(raw_force_file, z=z, force=force)
+            print("Raw force curve data saved")
             
-            # Plot force curve
-            print(f"Plotting force curve for scenario {scenario+1}")
-            axs[scenario, 1].plot(z * 1e6, force * 1e23)
-            
-            # Add resonance ellipse
-            z_res = Delta / (mu_B * g_factor * gamma_B)
-            x_res = np.sqrt(z_res**2 / 4)
-            ellipse = plt.Circle((0, z_res * 1e6), x_res * 1e6, fill=False, color='purple', linestyle='--')
-            axs[scenario, 0].add_artist(ellipse)
-        
         except Exception as e:
             print(f"Error in scenario {scenario+1}: {str(e)}")
             import traceback
             traceback.print_exc()
     
-    try:
-        # Add extra force curve for S=1 in second scenario
-        print("Creating extra force curve for S=1")
-        z, force = create_force_curve((-200e-6, 200e-6), -2 * np.pi * 200e3, 1)
-        axs[1, 1].plot(z * 1e6, force * 1e23)
-        
-        # Set labels and titles
-        for ax in axs[:, 0]:
-            ax.set_xlabel('x (µm)')
-            ax.set_ylabel('z (µm)')
-        
-        for ax in axs[:, 1]:
-            ax.set_xlabel('z (µm)')
-            ax.set_ylabel('Force/10$^{-23}$ (N)')
-        
-        axs[0, 1].legend(['S = 250'])
-        axs[1, 1].legend(['S = 20', 'S = 1'])
-        
-       
-        print("Showing plot")
-        plt.show()
-        print("Plot displayed")
-    except Exception as e:
-        print(f"Error in final plotting: {str(e)}")
-        import traceback
-        traceback.print_exc()
+    print("All data saved")
+
+
 # Set initial conditions
 initial_temp = 1e-6  # initial temperature in K
 ellipsoid_radii = [100e-6, 100e-6, 200e-6]  # radii for the initial ellipsoid
 
-# Run the simulation and plot
-plot_figure_1()
+# Call the function
+plot_figure_1(save_prefix='nmot_plot', reduced_complexity=False)
