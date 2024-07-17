@@ -147,32 +147,17 @@ def calculate_coupling_strength(B_local, k_vectors, polarizations):
     
     return W
 
-def calculate_force(positions, velocities, params, k_vectors):
-    """
-    Calculate the force on atoms from all six laser beams.
-    
-    Args:
-    positions (array): Nx3 array of atom positions
-    velocities (array): Nx3 array of atom velocities
-    params (dict): Parameters including delta, S, gradient
-    k_vectors (array): 6x3 array of laser beam directions
-    
-    Returns:
-    array: Nx3 array of force vectors for each atom
-    """
-    B_local = calculate_magnetic_field(positions, params['gradient'])
-    delta_omega_z = g_factor * mu_B * np.linalg.norm(B_local, axis=1) / hbar
-    
+def calculate_force(positions, velocities, params, k_vectors, zeeman_splitting):
     force = np.zeros_like(positions)
     
     for i, k in enumerate(k_vectors):
         doppler_shift = np.sum(velocities * k, axis=1)
-        detuning = params['delta'] - doppler_shift - delta_omega_z
+        detuning = params['delta'] - doppler_shift[:, np.newaxis] - zeeman_splitting[:, np.newaxis] * np.array([-1, 0, 1])
         
         gamma_prime = gamma * np.sqrt(1 + params['S'])
         scattering_rate = 0.5 * gamma * params['S'] / (1 + params['S'] + 4 * (detuning / gamma_prime)**2)
         
-        force += hbar * k_light * scattering_rate[:, np.newaxis] * k
+        force += hbar * k_light * np.sum(scattering_rate, axis=1)[:, np.newaxis] * k
     
     return force
 
@@ -236,18 +221,33 @@ def calculate_resonance_condition(x, z, delta, gradient):
     delta_omega_z = g_factor * mu_B * B / hbar
     return np.abs(delta_omega_z) == np.abs(delta)
 
-def calculate_scattering_probability(delta, S, gamma, B_local, velocities, k_vectors, W, dt):
-    delta_omega_z = g_factor * mu_B * np.linalg.norm(B_local, axis=1) / hbar
+def calculate_scattering_probability(delta, S, gamma, zeeman_splitting, velocities, k_vectors, W, dt):
     P = np.zeros((len(velocities), len(k_vectors), 3))
     
     for i, k in enumerate(k_vectors):
         doppler_shift = np.dot(velocities, k)
-        detuning = delta - doppler_shift[:, np.newaxis] - delta_omega_z[:, np.newaxis] * np.array([-1, 0, 1])
+        detuning = delta - doppler_shift[:, np.newaxis] - zeeman_splitting[:, np.newaxis] * np.array([-1, 0, 1])
         gamma_prime = gamma * np.sqrt(1 + S)
         rho_ee = 0.5 * S / (1 + S + 4 * (detuning / gamma_prime)**2)
         P[:, i, :] = gamma * W[:, i, :] * rho_ee * dt
     
     return P
+
+def calculate_zeeman_splitting(positions, gradient):
+    """
+    Calculate the Zeeman splitting for each atom based on its position in the magnetic field.
+    
+    Args:
+    positions (array): Nx3 array of atom positions
+    gradient (float): Magnetic field gradient in T/m
+    
+    Returns:
+    array: N-element array of Zeeman splitting values
+    """
+    B_local = calculate_magnetic_field(positions, gradient)
+    B_magnitude = np.linalg.norm(B_local, axis=1)
+    delta_omega_z = g_factor * mu_B * B_magnitude / hbar
+    return delta_omega_z
 
 def determine_regime(S, delta, gamma):
     delta_normalized = abs(delta) / gamma
@@ -290,6 +290,7 @@ def run_simulation(num_atoms, total_time, initial_size, initial_temperature, del
     ])
     
     polarizations = calculate_laser_polarization(k_vectors)
+    zeeman_splitting = calculate_zeeman_splitting(positions, gradient)
     
     history = []
     
@@ -299,13 +300,14 @@ def run_simulation(num_atoms, total_time, initial_size, initial_temperature, del
             print(f"Step {step}/{num_steps}")
         
         B_local = calculate_magnetic_field(positions, gradient)
+        zeeman_splitting = calculate_zeeman_splitting(positions, gradient)
         W = calculate_coupling_strength(B_local, k_vectors, polarizations)
         
         # Calculate forces
-        forces = calculate_force(positions, velocities, params, k_vectors)
+        forces = calculate_force(positions, velocities, params, k_vectors, zeeman_splitting)
         
         # Calculate scattering probabilities
-        P = calculate_scattering_probability(params['delta'], params['S'], gamma, B_local, velocities, k_vectors, W, dt)
+        P = calculate_scattering_probability(params['delta'], params['S'], gamma, zeeman_splitting, velocities, k_vectors, W, dt)
         
         # Determine scattering events
         scattered_photons = np.random.random(P.shape) < P
@@ -444,15 +446,25 @@ def plot_figure1(history1, history2, params1, params2, regime1, regime2):
 
 def plot_force_curve(ax, params, title, extra_S=None):
     z = np.linspace(-300e-6, 300e-6, 1000)
+    positions = np.zeros((len(z), 3))
+    positions[:, 2] = z  # Set z-coordinates
+    velocities = np.zeros_like(positions)  # Assume zero velocity
     
-    force = calculate_force(z, params)
-    ax.plot(force * 1e23, z * 1e6, 'r-', label=f'S = {params["S"]}')
+    k_vectors = np.array([
+        [0, 0, 1],
+        [0, 0, -1]
+    ])  # Only consider vertical beams for simplicity
+    
+    zeeman_splitting = calculate_zeeman_splitting(positions, params['gradient'])
+    
+    force = calculate_force(positions, velocities, params, k_vectors, zeeman_splitting)
+    ax.plot(force[:, 2] * 1e23, z * 1e6, 'r-', label=f'S = {params["S"]}')
     
     if extra_S is not None:
         extra_params = params.copy()
         extra_params['S'] = extra_S
-        extra_force = calculate_force(z, extra_params)
-        ax.plot(extra_force * 1e23, z * 1e6, 'b-', label=f'S = {extra_S}')
+        extra_force = calculate_force(positions, velocities, extra_params, k_vectors, zeeman_splitting)
+        ax.plot(extra_force[:, 2] * 1e23, z * 1e6, 'b-', label=f'S = {extra_S}')
     
     ax.set_xlabel('Force/10^-23 (N)')
     ax.set_ylabel('z (μm)')
