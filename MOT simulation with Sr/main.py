@@ -338,7 +338,8 @@ def run_simulation(num_atoms, total_time, initial_size, initial_temperature, del
         if step % 10 == 0:  # Store history more frequently
             history.append((positions.copy(), velocities.copy()))
     
-    return history
+    regime = determine_regime(S, delta, gamma)
+    return history, regime
 
 def run_specific_simulation(delta, S, gradient, num_atoms=5000, total_time=15e-3):
     params = set_simulation_parameters(delta, S, gradient)
