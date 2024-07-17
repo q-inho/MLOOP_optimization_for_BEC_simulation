@@ -113,6 +113,14 @@ def calculate_cloud_properties(positions, velocities):
 def calculate_coupling_strength(B_local, k_vectors, polarizations):
     """
     Calculate the coupling strength for each atom and laser beam, considering all Zeeman sublevels.
+    
+    Args:
+    B_local (array): Nx3 array of local magnetic field vectors for N atoms
+    k_vectors (array): 6x3 array of laser beam directions
+    polarizations (array): 6x3x3 array of polarization vectors (ε+, ε0, ε-)
+    
+    Returns:
+    array: Nx6x3 array of coupling strengths W for each atom, laser beam, and Zeeman sublevel
     """
     N = len(B_local)
     W = np.zeros((N, len(k_vectors), 3))
@@ -120,7 +128,6 @@ def calculate_coupling_strength(B_local, k_vectors, polarizations):
     B_norm = np.linalg.norm(B_local, axis=1)
     B_unit = B_local / B_norm[:, np.newaxis]
     
-    # Clebsch-Gordan coefficients for J=0 to J'=1 transition
     CG = np.array([
         [1/np.sqrt(2), 1/np.sqrt(6), 1/np.sqrt(3)],  # σ+
         [0, -2/np.sqrt(6), 0],                       # π
@@ -140,29 +147,34 @@ def calculate_coupling_strength(B_local, k_vectors, polarizations):
     
     return W
 
-def calculate_force(z, params):
+def calculate_force(positions, velocities, params, k_vectors):
     """
-    Calculate the force on atoms as a function of position z.
+    Calculate the force on atoms from all six laser beams.
     
     Args:
-    z (array): Positions to calculate force at
+    positions (array): Nx3 array of atom positions
+    velocities (array): Nx3 array of atom velocities
     params (dict): Parameters including delta, S, gradient
+    k_vectors (array): 6x3 array of laser beam directions
     
     Returns:
-    array: Force at each position z
+    array: Nx3 array of force vectors for each atom
     """
-    B = params['gradient'] * np.abs(z)  # Magnetic field
-    delta_omega_z = g_factor * mu_B * B / hbar  # Zeeman shift
+    B_local = calculate_magnetic_field(positions, params['gradient'])
+    delta_omega_z = g_factor * mu_B * np.linalg.norm(B_local, axis=1) / hbar
     
-    # Calculate detuning for σ+ and σ- transitions
-    detuning_plus = params['delta'] - delta_omega_z
-    detuning_minus = params['delta'] + delta_omega_z
+    force = np.zeros_like(positions)
     
-    # Calculate force contributions from σ+ and σ- beams
-    force_plus = calculate_beam_force(detuning_plus, params['S'])
-    force_minus = -calculate_beam_force(detuning_minus, params['S'])  # Negative because beam direction is opposite
+    for i, k in enumerate(k_vectors):
+        doppler_shift = np.sum(velocities * k, axis=1)
+        detuning = params['delta'] - doppler_shift - delta_omega_z
+        
+        gamma_prime = gamma * np.sqrt(1 + params['S'])
+        scattering_rate = 0.5 * gamma * params['S'] / (1 + params['S'] + 4 * (detuning / gamma_prime)**2)
+        
+        force += hbar * k_light * scattering_rate[:, np.newaxis] * k
     
-    return force_plus + force_minus
+    return force
 
 def calculate_beam_force(detuning, S):
     """
@@ -228,24 +240,11 @@ def calculate_scattering_probability(delta, S, gamma, B_local, velocities, k_vec
     delta_omega_z = g_factor * mu_B * np.linalg.norm(B_local, axis=1) / hbar
     P = np.zeros((len(velocities), len(k_vectors), 3))
     
-    regime = determine_regime(S, delta, gamma)
-    
     for i, k in enumerate(k_vectors):
         doppler_shift = np.dot(velocities, k)
         detuning = delta - doppler_shift[:, np.newaxis] - delta_omega_z[:, np.newaxis] * np.array([-1, 0, 1])
-        
-        if regime == "Doppler":
-            # Standard Doppler cooling equation
-            rho_ee = 0.5 * S / (1 + S + 4 * (detuning / gamma)**2)
-        elif regime == "Power-broadened":
-            # Power-broadened regime
-            gamma_prime = gamma * np.sqrt(1 + S)
-            rho_ee = 0.5 * S / (1 + S + 4 * (detuning / gamma_prime)**2)
-        else:  # Quantum regime
-            # In the quantum regime, we need to consider the recoil shift
-            omega_r = (hbar * k_light**2) / (2 * M)
-            rho_ee = 0.5 * S / (1 + S + 4 * ((detuning - omega_r) / gamma)**2)
-        
+        gamma_prime = gamma * np.sqrt(1 + S)
+        rho_ee = 0.5 * S / (1 + S + 4 * (detuning / gamma_prime)**2)
         P[:, i, :] = gamma * W[:, i, :] * rho_ee * dt
     
     return P
@@ -301,14 +300,27 @@ def run_simulation(num_atoms, total_time, initial_size, initial_temperature, del
         
         B_local = calculate_magnetic_field(positions, gradient)
         W = calculate_coupling_strength(B_local, k_vectors, polarizations)
+        
+        # Calculate forces
+        forces = calculate_force(positions, velocities, params, k_vectors)
+        
+        # Calculate scattering probabilities
         P = calculate_scattering_probability(params['delta'], params['S'], gamma, B_local, velocities, k_vectors, W, dt)
         
+        # Determine scattering events
         scattered_photons = np.random.random(P.shape) < P
         
+        # Update velocities due to forces and scattering
+        velocities += forces * dt / M  # Force contribution
         velocities = update_velocity_with_recoil(velocities, scattered_photons, k_vectors)
-        positions, velocities = update_position_and_velocity(positions, velocities, dt)
         
-        if step % 10 == 0:  # Store history more frequently
+        # Update positions
+        positions += velocities * dt + 0.5 * np.array([0, 0, -g]) * dt**2
+        
+        # Update velocities due to gravity
+        velocities += np.array([0, 0, -g]) * dt
+        
+        if step % 10 == 0:  # Store history every 10 steps
             history.append((positions.copy(), velocities.copy()))
     
     return history, determine_regime(S, delta, gamma)
@@ -428,16 +440,6 @@ def plot_figure1(history1, history2, params1, params2, regime1, regime2):
     plt.tight_layout()
     plt.show()
     
-    # Print cloud properties
-    print("Case 1 (S = 250, Δ = -2π × 110 kHz):")
-    print(f"Final position (µm): {properties1[-1]['position']*1e6}")
-    print(f"Final size (µm): {properties1[-1]['size']*1e6}")
-    print(f"Final temperature (µK): {properties1[-1]['temperature']*1e6}")
-    
-    print("\nCase 2 (S = 20, Δ = -2π × 200 kHz):")
-    print(f"Final position (µm): {properties2[-1]['position']*1e6}")
-    print(f"Final size (µm): {properties2[-1]['size']*1e6}")
-    print(f"Final temperature (µK): {properties2[-1]['temperature']*1e6}")
 
 
 def plot_force_curve(ax, params, title, extra_S=None):
@@ -535,6 +537,8 @@ params1 = set_simulation_parameters(delta1, S1, gradient)
 S2, delta2 = 20, -2 * np.pi * 200e3
 history2, regime2 = run_simulation(num_atoms, total_time, initial_size, initial_temperature, delta2, S2, gradient)
 params2 = set_simulation_parameters(delta2, S2, gradient)
+
+
 
 
 print(f"Regime for Case 1: {regime1}")
